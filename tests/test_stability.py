@@ -39,19 +39,32 @@ class AnnotationManagerTests(unittest.TestCase):
                 "class_name": "cat",
                 "bbox": [1, 2, 3, 4],
             }
+            registry_before = (Path(temp_dir) / "projects.json").read_bytes()
             manager.save_annotations("project1", 0, [annotation])
 
-            registry = json.loads((Path(temp_dir) / "projects.json").read_text())
+            registry_path = Path(temp_dir) / "projects.json"
+            registry = json.loads(registry_path.read_text())
             detail = json.loads(
                 (Path(temp_dir) / "project1" / "annotations.json").read_text()
             )
-            self.assertTrue(registry["projects"][0]["images"][0]["annotated"])
+            self.assertEqual(registry["schema_version"], 2)
+            self.assertNotIn("images", registry["projects"][0])
+            self.assertEqual(registry["projects"][0]["image_count"], 1)
+            self.assertEqual(registry_path.read_bytes(), registry_before)
             self.assertEqual(
                 detail["images"][0]["annotations"][0]["id"],
                 "annotation1",
             )
             self.assertEqual(list(Path(temp_dir).rglob("*.tmp")), [])
-            self.assertTrue((Path(temp_dir) / "projects.json.bak").is_file())
+            self.assertTrue(
+                (Path(temp_dir) / "project1" / "annotations.json.bak").is_file()
+            )
+
+            reloaded = AnnotationManager(temp_dir, start_autosave=False)
+            self.assertEqual(
+                reloaded.get_annotations("project1", 0)[0]["id"],
+                "annotation1",
+            )
 
     def test_corrupt_registry_recovers_from_valid_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -146,6 +159,13 @@ class FlaskContractTests(unittest.TestCase):
             (self.root / "data" / project["id"] / "annotations.json").read_text()
         )
         self.assertEqual(detail["images"][0]["annotations"][0]["id"], "a1")
+
+        project_list = self.client.get("/api/project/list")
+        self.assertEqual(project_list.status_code, 200)
+        summary = project_list.get_json()["projects"][0]
+        self.assertNotIn("images", summary)
+        self.assertEqual(summary["image_count"], 1)
+        self.assertEqual(summary["annotated_count"], 1)
 
         invalid = self.client.post(
             "/api/annotation/save",

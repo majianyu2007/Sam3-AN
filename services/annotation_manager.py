@@ -125,11 +125,40 @@ class AnnotationManager:
         projects = data.get("projects", [])
         if not isinstance(projects, list):
             raise ValueError("projects.json 中的 projects 必须是数组")
-        self.projects = {
-            project["id"]: project
-            for project in projects
-            if isinstance(project, dict) and project.get("id")
-        }
+
+        schema_version = data.get("schema_version", 1)
+        loaded = {}
+        for stored_project in projects:
+            if not isinstance(stored_project, dict) or not stored_project.get("id"):
+                continue
+            project = copy.deepcopy(stored_project)
+            project_id = project["id"]
+            detail_path = self.data_dir / project_id / "annotations.json"
+            detail = self._load_json_with_recovery(detail_path, {})
+            detail_images = detail.get("images")
+            detail_updated = detail.get("updated_at", "")
+            registry_updated = project.get("updated_at", "")
+            use_detail = (
+                isinstance(detail_images, list)
+                and (
+                    schema_version >= 2
+                    or "images" not in project
+                    or detail_updated >= registry_updated
+                )
+            )
+            if use_detail:
+                project["images"] = detail_images
+                if isinstance(detail.get("classes"), list):
+                    project["classes"] = detail["classes"]
+                if detail_updated > registry_updated:
+                    project["updated_at"] = detail_updated
+            else:
+                project.setdefault("images", [])
+            project.setdefault("classes", [])
+            project.pop("image_count", None)
+            project.pop("annotated_count", None)
+            loaded[project_id] = project
+        self.projects = loaded
 
     def autosave_loop(self):
         """等待一个周期后再保存；启动时不立即覆盖刚读取的数据。"""
@@ -140,12 +169,32 @@ class AnnotationManager:
             except Exception as error:
                 print(f"[ERROR] 自动保存失败: {error}")
 
+    @staticmethod
+    def _registry_record(project: dict) -> dict:
+        """注册表仅保存项目元数据；大体积图片/标注留在项目明细文件。"""
+        record = {
+            key: value
+            for key, value in project.items()
+            if key != "images"
+        }
+        images = project.get("images", [])
+        record["image_count"] = len(images)
+        record["annotated_count"] = sum(
+            1 for image in images if image.get("annotated", False)
+        )
+        return record
+
+
     def _save_all_projects(self):
         with self._lock:
             self._atomic_write_json(
                 self.data_dir / "projects.json",
                 {
-                    "projects": list(self.projects.values()),
+                    "schema_version": 2,
+                    "projects": [
+                        self._registry_record(project)
+                        for project in self.projects.values()
+                    ],
                     "updated_at": datetime.now().isoformat(),
                 },
             )
@@ -158,10 +207,14 @@ class AnnotationManager:
             self._atomic_write_json(
                 self.data_dir / project_id / "annotations.json",
                 {
+                    "schema_version": 2,
                     "project_id": project_id,
                     "images": project.get("images", []),
                     "classes": project.get("classes", []),
-                    "updated_at": datetime.now().isoformat(),
+                    "updated_at": project.get(
+                        "updated_at",
+                        datetime.now().isoformat(),
+                    ),
                 },
             )
 
@@ -227,6 +280,16 @@ class AnnotationManager:
     def list_projects(self) -> list:
         with self._lock:
             return copy.deepcopy(list(self.projects.values()))
+    def list_project_summaries(self) -> list:
+        """返回不含图片和标注大数组的轻量项目列表。"""
+        with self._lock:
+            return copy.deepcopy(
+                [
+                    self._registry_record(project)
+                    for project in self.projects.values()
+                ]
+            )
+
 
     def update_project(self, project_id: str, updates: dict) -> dict:
         with self._lock:
@@ -287,7 +350,6 @@ class AnnotationManager:
             image.setdefault("annotations", []).extend(annotations)
             image["annotated"] = bool(image["annotations"])
             project["updated_at"] = datetime.now().isoformat()
-            self._save_all_projects()
             self._save_project_annotations(project_id)
 
     def save_annotations(self, project_id: str, image_index: int, annotations: list):
@@ -298,7 +360,6 @@ class AnnotationManager:
             image["annotated"] = bool(annotations)
             project["current_index"] = image_index
             project["updated_at"] = datetime.now().isoformat()
-            self._save_all_projects()
             self._save_project_annotations(project_id)
 
     def get_annotations(self, project_id: str, image_index: int) -> list:
@@ -329,7 +390,6 @@ class AnnotationManager:
                 raise ValueError(f"标注不存在: {annotation_id}")
             annotation.update(copy.deepcopy(updates))
             project["updated_at"] = datetime.now().isoformat()
-            self._save_all_projects()
             self._save_project_annotations(project_id)
 
     def delete_annotation(self, project_id: str, image_index: int, annotation_id: str):
@@ -343,7 +403,6 @@ class AnnotationManager:
             image["annotations"] = remaining
             image["annotated"] = bool(remaining)
             project["updated_at"] = datetime.now().isoformat()
-            self._save_all_projects()
             self._save_project_annotations(project_id)
 
     def update_classes(self, project_id: str, classes: list):
@@ -365,7 +424,6 @@ class AnnotationManager:
             image = self._require_image(project, image_index)
             image["annotated"] = annotated
             project["updated_at"] = datetime.now().isoformat()
-            self._save_all_projects()
             self._save_project_annotations(project_id)
 
     def get_annotation_stats(self, project_id: str) -> dict:

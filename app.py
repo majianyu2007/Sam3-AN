@@ -374,7 +374,7 @@ def load_project_images(project_id):
 @app.route('/api/project/list', methods=['GET'])
 def list_projects():
     """列出所有项目"""
-    projects = annotation_manager.list_projects()
+    projects = annotation_manager.list_project_summaries()
     return jsonify({'success': True, 'projects': projects})
 
 
