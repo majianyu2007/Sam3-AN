@@ -12,6 +12,9 @@ ENV/
 # local/runtime outputs
 uploads/
 *.log
+data/**/*.bak
+data/**/*.corrupt-*.json
+data/**/.*.tmp
 
 # model weights / large artifacts (do not commit)
 *.pt

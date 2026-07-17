@@ -9,6 +9,8 @@ from PIL import Image, ImageOps
 import torch
 import uuid
 import traceback
+import threading
+from functools import wraps
 
 # 使用本地 SAM_src 目录
 sam3_src = Path(__file__).parent.parent / "SAM_src"
@@ -39,6 +41,16 @@ def _select_device() -> str:
     return "cpu"
 
 
+def _serialized_inference(method):
+    """串行化共享 processor 状态，避免 threaded Flask 请求相互覆盖。"""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._inference_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class SAM3Service:
     """SAM3模型服务"""
 
@@ -50,6 +62,7 @@ class SAM3Service:
         self.inference_state = None
         self.video_sessions = {}
         self._image_size = None
+        self._inference_lock = threading.RLock()
 
     def _init_image_model(self):
         """初始化图像分割模型"""
@@ -220,6 +233,7 @@ class SAM3Service:
 
         return result.tolist()
 
+    @_serialized_inference
     def segment_by_text(self, image_path: str, prompt: str, confidence: float = 0.5) -> list:
         """文本提示分割"""
         try:
@@ -241,11 +255,12 @@ class SAM3Service:
 
             return self._extract_results(output, prompt)
 
-        except Exception as e:
-            print(f"[ERROR] segment_by_text: {e}")
+        except Exception as error:
+            print(f"[ERROR] segment_by_text: {error}")
             traceback.print_exc()
-            return []
+            raise RuntimeError(f"文本分割失败: {error}") from error
 
+    @_serialized_inference
     def segment_by_points(self, image_path: str, points: list) -> list:
         """点击分割 - 支持正负样本点
 
@@ -308,10 +323,10 @@ class SAM3Service:
 
             return self.segment_by_boxes(image_path, boxes)
 
-        except Exception as e:
-            print(f"[ERROR] segment_by_points: {e}")
+        except Exception as error:
+            print(f"[ERROR] segment_by_points: {error}")
             traceback.print_exc()
-            return []
+            raise RuntimeError(f"点击分割失败: {error}") from error
 
     def _mask_in_negative_region(self, mask: np.ndarray, negative_boxes: list, threshold: float = 0.5) -> bool:
         """检查 mask 是否主要位于负样本区域内
@@ -379,6 +394,7 @@ class SAM3Service:
         overlap_ratio = inter_area / min_area
         return overlap_ratio > threshold
 
+    @_serialized_inference
     def segment_by_boxes(self, image_path: str, boxes: list) -> list:
         """框选分割 - 支持正负样本
 
@@ -461,10 +477,10 @@ class SAM3Service:
 
             return results
 
-        except Exception as e:
-            print(f"[ERROR] segment_by_boxes: {e}")
+        except Exception as error:
+            print(f"[ERROR] segment_by_boxes: {error}")
             traceback.print_exc()
-            return []
+            raise RuntimeError(f"框选分割失败: {error}") from error
 
     def _extract_results_with_mask(self, output: dict, label: str, negative_boxes: list) -> list:
         """从输出提取结果，并使用 mask 级别过滤负样本区域"""

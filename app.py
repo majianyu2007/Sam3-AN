@@ -4,6 +4,9 @@ import subprocess
 import threading
 import webbrowser
 from pathlib import Path
+import atexit
+import re
+import shutil
 
 # 添加SAM3到路径 (使用本地 SAM_src 目录)
 sam3_src = Path(__file__).parent / "SAM_src"
@@ -16,7 +19,7 @@ import uuid
 import requests
 from datetime import datetime
 
-from services.sam3_service import SAM3Service
+from services.sam3_service import SAM3Service, _select_device
 from services.annotation_manager import AnnotationManager
 from exports.yolo_exporter import YOLOExporter
 from exports.coco_exporter import COCOExporter
@@ -32,14 +35,107 @@ app.config['UPLOAD_FOLDER'].mkdir(exist_ok=True)
 # 全局服务实例
 sam3_service = None
 annotation_manager = AnnotationManager()
+sam3_service_lock = threading.Lock()
+
+
+WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def normalize_directory(
+    raw_path,
+    field_name,
+    *,
+    required=False,
+    must_exist=False,
+    create=False,
+):
+    """展开用户目录并拒绝当前系统无法使用的跨平台路径。"""
+    value = str(raw_path or "").strip()
+    if not value:
+        if required:
+            raise ValueError(f"{field_name}不能为空")
+        return ""
+    if sys.platform != "win32" and (
+        WINDOWS_ABSOLUTE_PATH.match(value) or value.startswith("\\\\")
+    ):
+        raise ValueError(
+            f"{field_name}是 Windows 路径，当前 macOS/Linux 无法访问；"
+            "请重新选择本机目录"
+        )
+    path = Path(os.path.expandvars(value)).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve()
+    if must_exist and not path.is_dir():
+        raise ValueError(f"{field_name}不存在或不是目录: {path}")
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def json_body():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+    return data
+
+
+def normalize_classes(raw_classes):
+    if isinstance(raw_classes, str):
+        raw_classes = raw_classes.split(',')
+    if not isinstance(raw_classes, list):
+        raise ValueError("类别必须是数组或逗号分隔的字符串")
+    classes = []
+    for item in raw_classes:
+        name = str(item).strip()
+        if name and name not in classes:
+            classes.append(name)
+    return classes
+
+
+def resolve_allowed_image(raw_path):
+    value = str(raw_path or "").strip()
+    if not value:
+        raise ValueError("缺少图片路径")
+    if sys.platform != "win32" and WINDOWS_ABSOLUTE_PATH.match(value):
+        raise ValueError("当前系统无法访问该 Windows 图片路径")
+    image_path = Path(value).expanduser().resolve()
+    allowed_dirs = {app.config['UPLOAD_FOLDER'].resolve()}
+    for project in annotation_manager.list_projects():
+        image_dir = project.get('image_dir')
+        if image_dir:
+            allowed_dirs.add(Path(image_dir).expanduser().resolve())
+    is_allowed = any(
+        image_path == directory or directory in image_path.parents
+        for directory in allowed_dirs
+    )
+    if not image_path.is_file() or not is_allowed:
+        raise FileNotFoundError("图片不存在或不属于当前项目")
+    return image_path
+
+
+def error_response(message, status=400, **details):
+    return jsonify({"success": False, "error": str(message), **details}), status
 
 
 def get_sam3_service():
-    """延迟加载SAM3服务"""
+    """线程安全地延迟加载 SAM3 服务。"""
     global sam3_service
     if sam3_service is None:
-        sam3_service = SAM3Service()
+        with sam3_service_lock:
+            if sam3_service is None:
+                sam3_service = SAM3Service()
     return sam3_service
+
+
+def shutdown_services():
+    """同步保存状态并释放模型资源。"""
+    annotation_manager.shutdown()
+    if sam3_service is not None:
+        sam3_service.shutdown()
+
+
+atexit.register(shutdown_services)
 
 
 # ==================== 页面路由 ====================
@@ -55,108 +151,224 @@ def video_page():
     """视频标注页面"""
     return render_template('video.html')
 
+# ==================== 系统 API ====================
+
+@app.route('/api/system/status')
+def system_status():
+    """返回前端可展示的本机运行状态。"""
+    checkpoint = Path.cwd() / 'sam3.pt'
+    device = _select_device()
+    return jsonify({
+        'success': True,
+        'platform': sys.platform,
+        'device': device,
+        'device_label': {
+            'cuda': 'NVIDIA CUDA',
+            'mps': 'Apple Silicon MPS',
+            'cpu': 'CPU'
+        }[device],
+        'checkpoint_ready': checkpoint.is_file(),
+        'checkpoint_path': str(checkpoint),
+        'checkpoint_size': checkpoint.stat().st_size if checkpoint.is_file() else 0,
+        'python_version': sys.version.split()[0]
+    })
+
+
+def choose_native_directory(prompt):
+    """在运行 Flask 的本机打开原生目录选择器。"""
+    if sys.platform == 'darwin':
+        script = '''
+on run argv
+    try
+        return POSIX path of (choose folder with prompt (item 1 of argv))
+    on error number -128
+        return ""
+    end try
+end run
+'''
+        command = ['osascript', '-e', script, prompt]
+    elif sys.platform == 'win32':
+        script = (
+            'Add-Type -AssemblyName System.Windows.Forms; '
+            '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; '
+            f'$dialog.Description = {json.dumps(prompt)}; '
+            'if ($dialog.ShowDialog() -eq \"OK\") { $dialog.SelectedPath }'
+        )
+        command = ['powershell', '-NoProfile', '-Command', script]
+    elif shutil.which('zenity'):
+        command = ['zenity', '--file-selection', '--directory', f'--title={prompt}']
+    else:
+        raise RuntimeError('当前桌面环境没有可用的原生目录选择器')
+
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    selected = completed.stdout.strip()
+    if not selected:
+        return None
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or '目录选择器启动失败')
+    return normalize_directory(
+        selected,
+        '所选目录',
+        required=True,
+        must_exist=True,
+    )
+
+
+@app.route('/api/system/select-directory', methods=['POST'])
+def select_native_directory():
+    """打开原生目录选择器；取消不是错误。"""
+    try:
+        data = json_body()
+        purpose = data.get('purpose', 'image')
+        prompt = '选择图片目录' if purpose == 'image' else '选择标注输出目录'
+        selected = choose_native_directory(prompt)
+        return jsonify({
+            'success': True,
+            'canceled': selected is None,
+            'path': selected
+        })
+    except subprocess.TimeoutExpired:
+        return error_response('目录选择超时', 504)
+    except Exception as error:
+        return error_response(error, 500)
+
 
 # ==================== 项目管理API ====================
 
 @app.route('/api/project/create', methods=['POST'])
 def create_project():
-    """创建新项目"""
-    data = request.json
-    project_id = str(uuid.uuid4())[:8]
-    project = {
-        'id': project_id,
-        'name': data.get('name', f'项目_{project_id}'),
-        'image_dir': data.get('image_dir', ''),
-        'output_dir': data.get('output_dir', ''),
-        'export_format': data.get('export_format', 'yolo'),
-        'classes': data.get('classes', []),
-        'created_at': datetime.now().isoformat(),
-        'images': [],
-        'current_index': 0
-    }
-    annotation_manager.create_project(project)
-    return jsonify({'success': True, 'project': project})
+    """创建新项目并规范化本机路径。"""
+    try:
+        data = json_body()
+        project_id = str(uuid.uuid4())[:8]
+        name = str(data.get('name') or f'项目_{project_id}').strip()
+        image_dir = normalize_directory(
+            data.get('image_dir'),
+            '图片目录',
+            must_exist=bool(data.get('image_dir')),
+        )
+        output_dir = normalize_directory(
+            data.get('output_dir'),
+            '输出目录',
+            create=bool(data.get('output_dir')),
+        )
+        project = annotation_manager.create_project({
+            'id': project_id,
+            'name': name,
+            'image_dir': image_dir,
+            'output_dir': output_dir,
+            'export_format': data.get('export_format', 'yolo'),
+            'classes': normalize_classes(data.get('classes', [])),
+            'created_at': datetime.now().isoformat(),
+            'images': [],
+            'current_index': 0
+        })
+        return jsonify({'success': True, 'project': project}), 201
+    except (ValueError, OSError) as error:
+        return error_response(error)
 
 
 @app.route('/api/project/<project_id>', methods=['GET'])
 def get_project(project_id):
-    """获取项目信息"""
+    """获取项目信息。"""
     project = annotation_manager.get_project(project_id)
-    if project:
-        return jsonify({'success': True, 'project': project})
-    return jsonify({'success': False, 'error': '项目不存在'})
+    if not project:
+        return error_response('项目不存在', 404)
+    return jsonify({'success': True, 'project': project})
 
 
 @app.route('/api/project/<project_id>/update', methods=['POST'])
 def update_project(project_id):
-    """更新项目信息"""
-    data = request.json
-    project = annotation_manager.get_project(project_id)
-
-    if not project:
-        return jsonify({'success': False, 'error': '项目不存在'})
-
-    # 构建更新字段
-    updates = {}
-    if 'name' in data:
-        updates['name'] = data['name']
-    if 'image_dir' in data:
-        updates['image_dir'] = data['image_dir']
-    if 'output_dir' in data:
-        updates['output_dir'] = data['output_dir']
-    if 'classes' in data:
-        updates['classes'] = data['classes']
-
+    """更新项目信息并验证路径。"""
+    if not annotation_manager.get_project(project_id):
+        return error_response('项目不存在', 404)
     try:
+        data = json_body()
+        updates = {}
+        if 'name' in data:
+            name = str(data['name']).strip()
+            if not name:
+                raise ValueError('项目名称不能为空')
+            updates['name'] = name
+        if 'image_dir' in data:
+            updates['image_dir'] = normalize_directory(
+                data['image_dir'],
+                '图片目录',
+                must_exist=bool(data['image_dir']),
+            )
+        if 'output_dir' in data:
+            updates['output_dir'] = normalize_directory(
+                data['output_dir'],
+                '输出目录',
+                create=bool(data['output_dir']),
+            )
+        if 'classes' in data:
+            updates['classes'] = normalize_classes(data['classes'])
         updated_project = annotation_manager.update_project(project_id, updates)
         return jsonify({'success': True, 'project': updated_project})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except (ValueError, OSError) as error:
+        return error_response(error)
 
 
 @app.route('/api/project/<project_id>/delete', methods=['POST'])
 def delete_project(project_id):
-    """删除项目"""
-    project = annotation_manager.get_project(project_id)
-
-    if not project:
-        return jsonify({'success': False, 'error': '项目不存在'})
-
+    """删除项目。"""
     try:
         annotation_manager.delete_project(project_id)
         return jsonify({'success': True, 'message': '项目已删除'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except ValueError as error:
+        return error_response(error, 404)
+    except OSError as error:
+        return error_response(error, 500)
 
 
 @app.route('/api/project/<project_id>/load_images', methods=['POST'])
 def load_project_images(project_id):
-    """加载项目图片目录"""
-    data = request.json
-    image_dir = data.get('image_dir', '')
-
-    if not os.path.isdir(image_dir):
-        return jsonify({'success': False, 'error': '目录不存在'})
-
-    # 支持的图片格式
-    extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
-    images = []
-
-    for f in sorted(os.listdir(image_dir)):
-        if Path(f).suffix.lower() in extensions:
-            images.append({
-                'filename': f,
-                'path': os.path.join(image_dir, f),
+    """扫描本机图片目录并保留同名图片的已有标注。"""
+    if not annotation_manager.get_project(project_id):
+        return error_response('项目不存在', 404)
+    try:
+        data = json_body()
+        image_dir = normalize_directory(
+            data.get('image_dir'),
+            '图片目录',
+            required=True,
+            must_exist=True,
+        )
+        directory = Path(image_dir)
+        extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
+        files = sorted(
+            (
+                path for path in directory.iterdir()
+                if path.is_file() and path.suffix.lower() in extensions
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+        images = [
+            {
+                'filename': path.name,
+                'path': str(path.resolve()),
                 'annotated': False,
                 'annotations': []
-            })
-
-    annotation_manager.update_project_images(project_id, images, image_dir)
-    return jsonify({
-        'success': True,
-        'count': len(images),
-        'images': images
-    })
+            }
+            for path in files
+        ]
+        annotation_manager.update_project_images(project_id, images, image_dir)
+        project = annotation_manager.get_project(project_id)
+        return jsonify({
+            'success': True,
+            'count': len(project['images']),
+            'images': project['images'],
+            'image_dir': image_dir
+        })
+    except (ValueError, OSError) as error:
+        return error_response(error)
 
 
 @app.route('/api/project/list', methods=['GET'])
@@ -170,287 +382,303 @@ def list_projects():
 
 @app.route('/api/image/serve')
 def serve_image():
-    """提供图片文件"""
-    path = request.args.get('path', '')
-    if not path:
-        return jsonify({'error': '缺少文件路径'}), 400
-
-    abs_path = Path(path).resolve()
-
-    # 仅允许读取已知项目图片目录或上传目录，避免任意文件读取
-    allowed_dirs = {app.config['UPLOAD_FOLDER'].resolve()}
-    for project in annotation_manager.list_projects():
-        image_dir = project.get('image_dir')
-        if image_dir:
-            allowed_dirs.add(Path(image_dir).resolve())
-
-    is_allowed = any(abs_path == d or d in abs_path.parents for d in allowed_dirs)
-    if not (abs_path.is_file() and is_allowed):
-        return jsonify({'error': '文件不存在或无权访问'}), 404
-
-    return send_file(abs_path)
+    """仅提供已登记项目目录内的图片文件。"""
+    try:
+        return send_file(resolve_allowed_image(request.args.get('path')))
+    except ValueError as error:
+        return error_response(error)
+    except FileNotFoundError as error:
+        return error_response(error, 404)
 
 
 # ==================== SAM3分割API ====================
 
 @app.route('/api/segment/text', methods=['POST'])
 def segment_by_text():
-    """文本提示分割"""
-    data = request.json
-    image_path = data.get('image_path')
-    prompt = data.get('prompt', '')
-    confidence = data.get('confidence', 0.5)
-
-    if not image_path or not prompt:
-        return jsonify({'success': False, 'error': '缺少必要参数'})
-
+    """文本提示分割。"""
     try:
-        service = get_sam3_service()
-        results = service.segment_by_text(image_path, prompt, confidence)
+        data = json_body()
+        image_path = resolve_allowed_image(data.get('image_path'))
+        prompt = str(data.get('prompt', '')).strip()
+        if not prompt:
+            raise ValueError('文本提示不能为空')
+        confidence = float(data.get('confidence', 0.5))
+        if not 0 <= confidence <= 1:
+            raise ValueError('置信度必须在 0 到 1 之间')
+        results = get_sam3_service().segment_by_text(
+            str(image_path),
+            prompt,
+            confidence,
+        )
         return jsonify({'success': True, 'results': results})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except (ValueError, FileNotFoundError) as error:
+        return error_response(error)
+    except Exception as error:
+        return error_response(error, 500)
 
 
 @app.route('/api/segment/point', methods=['POST'])
 def segment_by_point():
-    """点击分割"""
-    data = request.json
-    image_path = data.get('image_path')
-    points = data.get('points', [])  # [[x, y, label], ...]
-
-    if not image_path or not points:
-        return jsonify({'success': False, 'error': '缺少必要参数'})
-
+    """点击分割。"""
     try:
-        service = get_sam3_service()
-        results = service.segment_by_points(image_path, points)
+        data = json_body()
+        image_path = resolve_allowed_image(data.get('image_path'))
+        points = data.get('points')
+        if not isinstance(points, list) or not points:
+            raise ValueError('至少需要一个提示点')
+        if any(not isinstance(point, list) or len(point) != 3 for point in points):
+            raise ValueError('提示点格式必须为 [x, y, label]')
+        results = get_sam3_service().segment_by_points(str(image_path), points)
         return jsonify({'success': True, 'results': results})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except (ValueError, FileNotFoundError) as error:
+        return error_response(error)
+    except Exception as error:
+        return error_response(error, 500)
 
 
 @app.route('/api/segment/box', methods=['POST'])
 def segment_by_box():
-    """框选分割"""
-    data = request.json
-    image_path = data.get('image_path')
-    boxes = data.get('boxes', [])  # [[x1, y1, x2, y2, label], ...]
-
-    if not image_path or not boxes:
-        return jsonify({'success': False, 'error': '缺少必要参数'})
-
+    """框选分割。"""
     try:
-        service = get_sam3_service()
-        results = service.segment_by_boxes(image_path, boxes)
+        data = json_body()
+        image_path = resolve_allowed_image(data.get('image_path'))
+        boxes = data.get('boxes')
+        if not isinstance(boxes, list) or not boxes:
+            raise ValueError('至少需要一个提示框')
+        if any(
+            not isinstance(box, list) or len(box) not in (4, 5)
+            for box in boxes
+        ):
+            raise ValueError('提示框格式必须为 [x1, y1, x2, y2, label?]')
+        results = get_sam3_service().segment_by_boxes(str(image_path), boxes)
         return jsonify({'success': True, 'results': results})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except (ValueError, FileNotFoundError) as error:
+        return error_response(error)
+    except Exception as error:
+        return error_response(error, 500)
 
 
 @app.route('/api/segment/batch', methods=['POST'])
 def batch_segment():
-    """批量分割"""
-    data = request.json
-    project_id = data.get('project_id')
-    prompt = data.get('prompt', '')
-    class_name = data.get('class_name', prompt)  # 使用传入的类名，默认为prompt
-    start_index = data.get('start_index', 0)
-    end_index = data.get('end_index', -1)
-    skip_annotated = data.get('skip_annotated', True)
-    confidence = data.get('confidence', 0.5)
-
+    """服务端批量分割，逐张保存并返回失败明细。"""
     try:
-        service = get_sam3_service()
+        data = json_body()
+        project_id = data.get('project_id')
         project = annotation_manager.get_project(project_id)
-
         if not project:
-            return jsonify({'success': False, 'error': '项目不存在'})
+            return error_response('项目不存在', 404)
+        prompt = str(data.get('prompt', '')).strip()
+        if not prompt:
+            raise ValueError('文本提示不能为空')
+        class_name = str(data.get('class_name') or prompt).strip()
+        start_index = int(data.get('start_index', 0))
+        end_index = int(data.get('end_index', -1))
+        confidence = float(data.get('confidence', 0.5))
+        if start_index < 0 or end_index < -1 or not 0 <= confidence <= 1:
+            raise ValueError('批量分割参数无效')
 
-        images = project['images']
+        images = project.get('images', [])
         if end_index == -1:
             end_index = len(images)
-
+        end_index = min(end_index, len(images))
+        service = get_sam3_service()
         processed = 0
-        failed = 0
         total_detections = 0
         results = []
+        errors = []
 
-        for i in range(start_index, min(end_index, len(images))):
-            img_info = images[i]
-
-            # 跳过已标注的图片
-            if skip_annotated and img_info.get('annotated', False):
+        for index in range(start_index, end_index):
+            image = images[index]
+            if data.get('skip_annotated', True) and image.get('annotated', False):
                 continue
-
             try:
-                seg_results = service.segment_by_text(
-                    img_info['path'], prompt, confidence
+                detections = service.segment_by_text(
+                    image['path'],
+                    prompt,
+                    confidence,
                 )
-
-                if seg_results:
-                    # 使用传入的类名，而不是 prompt
-                    for r in seg_results:
-                        r['class_name'] = class_name
-
+                for detection in detections:
+                    detection['class_name'] = class_name
+                if detections:
                     annotation_manager.add_annotations(
-                        project_id, i, seg_results, class_name
+                        project_id,
+                        index,
+                        detections,
+                        class_name,
                     )
-                    processed += 1
-                    total_detections += len(seg_results)
-                    results.append({
-                        'index': i,
-                        'filename': img_info['filename'],
-                        'count': len(seg_results)
-                    })
-                else:
-                    # 没有检测到对象，也算处理过
-                    processed += 1
-
-            except Exception as e:
-                print(f"[ERROR] 批量分割图片 {img_info['filename']} 失败: {e}")
-                failed += 1
-                continue
+                processed += 1
+                total_detections += len(detections)
+                results.append({
+                    'index': index,
+                    'filename': image['filename'],
+                    'count': len(detections)
+                })
+            except Exception as error:
+                print(f"[ERROR] 批量分割图片 {image['filename']} 失败: {error}")
+                errors.append({
+                    'index': index,
+                    'filename': image['filename'],
+                    'error': str(error)
+                })
 
         return jsonify({
             'success': True,
             'processed': processed,
-            'failed': failed,
+            'failed': len(errors),
             'total_detections': total_detections,
-            'results': results
+            'results': results,
+            'errors': errors
         })
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)})
+    except ValueError as error:
+        return error_response(error)
+    except Exception as error:
+        return error_response(error, 500)
 
 
 # ==================== 标注管理API ====================
 
 @app.route('/api/annotation/save', methods=['POST'])
 def save_annotation():
-    """保存标注"""
-    data = request.json
-    project_id = data.get('project_id')
-    image_index = data.get('image_index')
-    annotations = data.get('annotations', [])
-
+    """立即持久化当前图片的完整标注列表。"""
     try:
-        annotation_manager.save_annotations(project_id, image_index, annotations)
+        data = json_body()
+        annotations = data.get('annotations', [])
+        if not isinstance(annotations, list):
+            raise ValueError('annotations 必须是数组')
+        annotation_manager.save_annotations(
+            data.get('project_id'),
+            data.get('image_index'),
+            annotations,
+        )
         return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except ValueError as error:
+        return error_response(error)
+    except OSError as error:
+        return error_response(f'写入标注失败: {error}', 500)
 
 
 @app.route('/api/annotation/get', methods=['GET'])
 def get_annotation():
-    """获取标注"""
-    project_id = request.args.get('project_id')
-    image_index = int(request.args.get('image_index', 0))
-
-    annotations = annotation_manager.get_annotations(project_id, image_index)
-    return jsonify({'success': True, 'annotations': annotations})
+    """获取标注。"""
+    try:
+        project_id = request.args.get('project_id')
+        image_index = int(request.args.get('image_index', 0))
+        annotations = annotation_manager.get_annotations(project_id, image_index)
+        return jsonify({'success': True, 'annotations': annotations})
+    except (TypeError, ValueError) as error:
+        return error_response(error)
 
 
 @app.route('/api/annotation/update', methods=['POST'])
 def update_annotation():
-    """更新单个标注（手动调整）"""
-    data = request.json
-    project_id = data.get('project_id')
-    image_index = data.get('image_index')
-    annotation_id = data.get('annotation_id')
-    updates = data.get('updates', {})
-
+    """更新单个标注。"""
     try:
+        data = json_body()
+        updates = data.get('updates', {})
+        if not isinstance(updates, dict):
+            raise ValueError('updates 必须是对象')
         annotation_manager.update_annotation(
-            project_id, image_index, annotation_id, updates
+            data.get('project_id'),
+            data.get('image_index'),
+            data.get('annotation_id'),
+            updates,
         )
         return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except ValueError as error:
+        return error_response(error)
+    except OSError as error:
+        return error_response(f'写入标注失败: {error}', 500)
 
 
 @app.route('/api/annotation/delete', methods=['POST'])
 def delete_annotation():
-    """删除标注"""
-    data = request.json
-    project_id = data.get('project_id')
-    image_index = data.get('image_index')
-    annotation_id = data.get('annotation_id')
-
+    """删除标注。"""
     try:
-        annotation_manager.delete_annotation(project_id, image_index, annotation_id)
+        data = json_body()
+        annotation_manager.delete_annotation(
+            data.get('project_id'),
+            data.get('image_index'),
+            data.get('annotation_id'),
+        )
         return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except ValueError as error:
+        return error_response(error)
+    except OSError as error:
+        return error_response(f'写入标注失败: {error}', 500)
 
 
 # ==================== 类别管理API ====================
 
 @app.route('/api/classes/update', methods=['POST'])
 def update_classes():
-    """更新类别列表"""
-    data = request.json
-    project_id = data.get('project_id')
-    classes = data.get('classes', [])
-
+    """更新去重后的类别列表。"""
     try:
-        annotation_manager.update_classes(project_id, classes)
+        data = json_body()
+        annotation_manager.update_classes(
+            data.get('project_id'),
+            normalize_classes(data.get('classes', [])),
+        )
         return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except ValueError as error:
+        return error_response(error)
+    except OSError as error:
+        return error_response(f'写入类别失败: {error}', 500)
 
 
 # ==================== 导出API ====================
 
 @app.route('/api/export/yolo', methods=['POST'])
 def export_yolo():
-    """导出YOLO格式"""
-    data = request.json
-    project_id = data.get('project_id')
-    output_dir = data.get('output_dir', '')
-    smooth_level = data.get('smooth_level', 'medium')
-    export_type = data.get('export_type', 'segment')  # 'detect' 或 'segment'
-
+    """导出 YOLO 数据集。"""
     try:
-        project = annotation_manager.get_project(project_id)
+        data = json_body()
+        project = annotation_manager.get_project(data.get('project_id'))
         if not project:
-            return jsonify({'success': False, 'error': '项目不存在'})
-
-        exporter = YOLOExporter()
-        result = exporter.export(
-            project, output_dir, 
-            format_type=export_type,
-            smooth_level=smooth_level
+            return error_response('项目不存在', 404)
+        output_dir = normalize_directory(
+            data.get('output_dir'),
+            '输出目录',
+            required=True,
+            create=True,
+        )
+        result = YOLOExporter().export(
+            project,
+            output_dir,
+            format_type=data.get('export_type', 'segment'),
+            smooth_level=data.get('smooth_level', 'medium'),
         )
         return jsonify({'success': True, 'result': result})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except ValueError as error:
+        return error_response(error)
+    except Exception as error:
+        return error_response(error, 500)
 
 
 @app.route('/api/export/coco', methods=['POST'])
 def export_coco():
-    """导出COCO格式"""
-    data = request.json
-    project_id = data.get('project_id')
-    output_dir = data.get('output_dir', '')
-    smooth_level = data.get('smooth_level', 'medium')
-    export_type = data.get('export_type', 'segment')  # 'detect' 或 'segment'
-
+    """导出 COCO 数据集。"""
     try:
-        project = annotation_manager.get_project(project_id)
+        data = json_body()
+        project = annotation_manager.get_project(data.get('project_id'))
         if not project:
-            return jsonify({'success': False, 'error': '项目不存在'})
-
-        exporter = COCOExporter()
-        result = exporter.export(
-            project, output_dir,
-            export_type=export_type,
-            smooth_level=smooth_level
+            return error_response('项目不存在', 404)
+        output_dir = normalize_directory(
+            data.get('output_dir'),
+            '输出目录',
+            required=True,
+            create=True,
+        )
+        result = COCOExporter().export(
+            project,
+            output_dir,
+            export_type=data.get('export_type', 'segment'),
+            smooth_level=data.get('smooth_level', 'medium'),
         )
         return jsonify({'success': True, 'result': result})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+    except ValueError as error:
+        return error_response(error)
+    except Exception as error:
+        return error_response(error, 500)
 
 
 # ==================== 导出预览API ====================
@@ -962,12 +1190,17 @@ def open_browser(url):
 # 退出程序的API
 @app.route('/api/app/exit', methods=['POST'])
 def exit_app():
-    """退出程序"""
-    func = request.environ.get('werkzeug.server.shutdown')
-    if func is None:
-        # 强制退出
-        os._exit(0)
-    func()
+    """先同步落盘，再在响应发出后停止本地服务。"""
+    try:
+        shutdown_services()
+    except Exception as error:
+        return error_response(f'退出前保存失败: {error}', 500)
+
+    shutdown = request.environ.get('werkzeug.server.shutdown')
+    if shutdown is not None:
+        threading.Timer(0.1, shutdown).start()
+    else:
+        threading.Timer(0.2, os._exit, args=(0,)).start()
     return jsonify({'success': True})
 
 

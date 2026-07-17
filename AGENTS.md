@@ -95,8 +95,8 @@ only in its own dev extras — not wired for the app.
   `jsonify({'success': False, 'error': str(e)})` inside a `try/except`. Match this for any new endpoint.
 - **Lazy service loading**: services needing the GPU model go through `get_sam3_service()` (singleton, first-call init).
   Do not import-time initialize SAM3 — it's ~3.2 GB and slow.
-- **Persistence via orjson + threading.Lock**: `AnnotationManager` serializes to `data/` under a lock with a 60s
-  daemon autosave thread. New stateful managers should follow the same lock + autosave pattern.
+- **Persistence via orjson + `threading.RLock`**: `AnnotationManager` writes immediately after mutations,
+  using fsynced temp files + `os.replace`, valid `.bak` recovery, a delayed 60s autosave, and graceful `shutdown()`.
 - **Routing layout**: `app.py` is organized by `# ==================== <Section> API ====================` comment banners
   (Project / Image / SAM3 segment / Annotation / Classes / Export / Export preview / Video / AI translate / App exit).
   Add new routes under the matching banner.
@@ -104,8 +104,8 @@ only in its own dev extras — not wired for the app.
   detect|segment mode and polygon smoothing. Pipeline: handlers build args → exporter.export() → return saved paths.
 - **Naming**: snake_case throughout Python; Flask routes use `/api/<resource>/<action>` (e.g. `/api/project/<id>/update`).
 - **i18n**: docstrings and UI strings are **Chinese**; user-facing error messages are Chinese. Preserve when editing.
-- **Frontend**: vanilla JS in `static/js/annotation.js`, no framework/bundler. Add features by extending the `state`
-  object and calling existing `fetch('/api/...')` helpers. Video page uses its own inline JS in `templates/video.html`.
+- **Frontend**: vanilla JS in `static/js/annotation.js`, no framework/bundler. Extend the `state` object and use
+  `apiRequest()` for `/api/*` calls so HTTP failures and `{success:false}` envelopes reach the user. Video page uses its own inline JS in `templates/video.html`.
 - **SAM3 source path hack**: `app.py` does `sys.path.insert(0, "SAM_src")` before importing SAM3 symbols. Any module needing SAM3 must rely on this side effect (or re-insert) — do not `pip install` the vendored package.
 - **Device selection (cross-platform)**: `services/sam3_service.py:_select_device()` picks CUDA > MPS (macOS Apple Silicon) > CPU at image-model init. `SAM_src/sam3/model_builder.py:_setup_device_and_mode()` uses `model.to(device)` for all devices. Force via `SAM3_DEVICE=cuda|mps|cpu` (unavailable requested devices fall back to CPU). Always construct `Sam3Processor(..., device=device)` explicitly — its upstream default is `"cuda"`.
 - **Vendored macOS patches — preserve on SAM3 updates**: `model/edt.py` guards unavailable macOS `triton`; `model_builder.py` uses device-agnostic `.to(device)`; `model/position_encoding.py` and `model/decoder.py` precompute caches on CPU then migrate once to the input device; `sam/transformer.py` invalidates RoPE cache on device mismatch; `model/geometry_encoders.py` avoids CUDA-only pinned-memory transfer semantics; `model/sam3_video_inference.py` disables CUDA autocast decorators when CUDA is unavailable. These are required for real MPS inference or clean macOS startup, not cosmetic changes.
@@ -119,7 +119,7 @@ only in its own dev extras — not wired for the app.
   AI-translate API config (key/url/model) is stored per-project in `data/`.
 - **Model factory/checkpoint**: `SAM_src/sam3/model_builder.py` defaults to `checkpoint_path='sam3.pt'` at CWD. Verified checkpoint: 3,450,062,241 bytes, SHA-256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`; downloaded from public mirror `1038lab/sam3` because official `facebook/sam3` is gated. `*.pt` is gitignored.
 - **State files**: `data/projects.json` (registry), `data/<project_id>/annotations.json` (per-project annotations).
-- **⚠ Autosave race**: `_save_all_projects` (`services/annotation_manager.py`) opens `projects.json` in `'wb'` (truncates) then writes, non-atomically. If the process dies mid-write the file is left empty → next start fails with `orjson.JSONDecodeError` on a zero-length doc. Avoid abrupt exits while annotation_manager is loaded; consider atomic write (tmp + os.replace) when touching this code.
+  Runtime `.bak`, `.corrupt-*.json`, and temp files are gitignored. Mutations write both registry and project detail immediately; startup recovers from a valid backup and preserves unrecoverable input under a timestamped corrupt filename.
 - **Vendor metadata**: `SAM_src/sam3.egg-info/PKG-INFO` (sam3 v0.1.0, requires-python >=3.8).
 
 ## Runtime / Tooling Preferences
@@ -134,13 +134,15 @@ only in its own dev extras — not wired for the app.
 
 ## Testing & QA
 
-- **No project-level test suite.** The only pytest file is `SAM_src/sam3/perflib/tests/tests.py`
-  (single class `TestMasksToBoxes`, upstream vendor test). A standalone `test_reindex_function()` exists in
-  `SAM_src/sam3/eval/coco_reindex.py` under `__main__` (not pytest-collected).
+- **Project stability suite**: `tests/test_stability.py` uses stdlib `unittest` for atomic persistence/recovery,
+  route envelopes/path validation, singleton concurrency, and inference-error propagation. Run:
+  `uv run python -m unittest discover -s tests -p 'test_stability.py' -v`.
+- **Vendor tests**: `SAM_src/sam3/perflib/tests/tests.py` contains the upstream `TestMasksToBoxes`; a standalone
+  `test_reindex_function()` exists in `SAM_src/sam3/eval/coco_reindex.py`.
 - **No CI config** (no `.github/`, no `tox.ini`, no `pytest.ini`).
 - **Verification practice**: smoke-test changes by running `python app.py` and exercising the affected
   `/api/*` route through the browser UI or a `curl` POST. Confirm the response envelope and that
   `data/projects.json` / per-project annotation files update as expected.
-- **Verified macOS path (Apple M5)**: checkpoint SHA-256 verified; strict MPS text inference on a 1600×1598 cat image returned one mask (`score=0.9551`, area `1,485,291`, 52-point polygon); point prompt returned two results; box prompt returned one (`score=0.9938`); Flask `/api/segment/text` and browser-page `fetch()` both returned HTTP 200 / `success:true`.
-- **Coverage**: not measured. Treat the Flask route layer and `AnnotationManager` persistence as the
-  load-bearing surface to manually verify on any change.
+- **Verified macOS path (Apple M5)**: strict MPS text/point/box inference passes. Current browser smoke test created
+  a POSIX-path project, scanned and loaded the first image, rejected a legacy Windows path visibly, restored state after reload, returned one real cat detection through `/api/segment/text`, and confirmed the saved annotation through `/api/annotation/get`.
+- **Coverage**: not measured. Treat Flask route contracts, browser workflows, and `AnnotationManager` persistence as load-bearing verification surfaces.
