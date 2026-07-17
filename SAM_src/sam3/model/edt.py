@@ -3,8 +3,28 @@
 """Triton kernel for euclidean distance transform (EDT)"""
 
 import torch
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:
+    # macOS 没有 triton wheels；edt_triton 仅在 CUDA 视频追踪路径使用（见
+    # edt_triton 内 assert data.is_cuda），图像分割不需要。这里提供 stub
+    # 以保证 import 不崩溃。
+    _HAS_TRITON = False
+
+    class _TlStub:
+        constexpr = None  # 注解占位
+
+    class _TritonStub:
+        @staticmethod
+        def jit(fn=None, **kwargs):
+            def _unavailable(*args, **kwargs):
+                raise RuntimeError("edt_triton 需要 'triton' 包（仅 CUDA 路径）")
+            return _unavailable
+
+    triton = _TritonStub()
+    tl = _TlStub()
 
 """
 Disclaimer: This implementation is not meant to be extremely efficient. A CUDA kernel would likely be more efficient.

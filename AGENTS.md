@@ -106,19 +106,21 @@ only in its own dev extras — not wired for the app.
 - **i18n**: docstrings and UI strings are **Chinese**; user-facing error messages are Chinese. Preserve when editing.
 - **Frontend**: vanilla JS in `static/js/annotation.js`, no framework/bundler. Add features by extending the `state`
   object and calling existing `fetch('/api/...')` helpers. Video page uses its own inline JS in `templates/video.html`.
-- **SAM3 source path hack**: `app.py` does `sys.path.insert(0, "SAM_src")` before importing SAM3 symbols. Any
-  module needing SAM3 must rely on this side effect (or re-insert) — do not `pip install` the vendored package.
+- **SAM3 source path hack**: `app.py` does `sys.path.insert(0, "SAM_src")` before importing SAM3 symbols. Any module needing SAM3 must rely on this side effect (or re-insert) — do not `pip install` the vendored package.
+- **Device selection (cross-platform)**: `services/sam3_service.py:_select_device()` picks CUDA > MPS (macOS Apple Silicon) > CPU at image-model init. The SAM3 factory `build_sam3_image_model` only moves the model when `device=="cuda"`; for MPS we build on CPU then `.to("mps")`. Force a device via `SAM3_DEVICE=cuda|mps|cpu` (falls back to CPU if unavailable). `Sam3Processor(device=...)` must be passed explicitly — its default is `"cuda"`.
+- **Vendored patch — `SAM_src/sam3/model/edt.py`**: `triton` has no macOS wheels, so `import triton` at module top would crash the whole `sam3` import chain (image path included) on macOS. We guarded the import with a stub (`_HAS_TRITON`) that lets `import sam3` succeed; the stub's `edt_triton` only raises if actually called (it asserts `data.is_cuda`, so it never runs on MPS/CPU anyway). Keep this guard when updating vendored SAM3.
 
 ## Important Files
 
 - **Entry point**: `app.py` (lines 1–11 bootstrapping; 965–979 launch block).
 - **Config**: `pyproject.toml` (deps, `requires-python = ">=3.11,<3.13"`), `uv.lock` (resolved versions),
   `.python-version` (uv Python pin), `requirements.txt` (legacy source list with platform markers), `.gitignore`.
-  No `.env`, no settings module — **zero env vars referenced** in `app.py`/`services/`/`exports/`.
+  No settings module — env var `SAM3_DEVICE` (`cuda|mps|cpu`) can override the inference device in `sam3_service.py`.
   AI-translate API config (key/url/model) is stored per-project in `data/`.
 - **Model factory**: `SAM_src/sam3/model_builder.py:560-561,640-646` — default `checkpoint_path='sam3.pt'`;
   HF fallback via `huggingface_hub.hf_hub_download('facebook/sam3', 'sam3.pt')`.
 - **State files**: `data/projects.json` (registry), `data/<project_id>/annotations.json` (per-project annotations).
+- **⚠ Autosave race**: `_save_all_projects` (`services/annotation_manager.py`) opens `projects.json` in `'wb'` (truncates) then writes, non-atomically. If the process dies mid-write the file is left empty → next start fails with `orjson.JSONDecodeError` on a zero-length doc. Avoid abrupt exits while annotation_manager is loaded; consider atomic write (tmp + os.replace) when touching this code.
 - **Vendor metadata**: `SAM_src/sam3.egg-info/PKG-INFO` (sam3 v0.1.0, requires-python >=3.8).
 
 ## Runtime / Tooling Preferences
@@ -127,8 +129,8 @@ only in its own dev extras — not wired for the app.
   — the `<3.13` upper bound respects `numpy==1.26` (broken on 3.13+). README's "3.10+" predates the uv migration.
 - **Server**: `app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)`. The background
   `open_browser` thread polls `wait_for_server` then launches the default browser at `http://localhost:5000`.
-- **GPU**: macOS uses default-index torch (MPS). CUDA Linux servers use the `cu126` index
-  (`--index-url https://download.pytorch.org/whl/cu126`) for torch. CPU works but is slow. ~6–8 GB VRAM recommended.
+- **GPU/device**: `_select_device()` → CUDA > MPS > CPU. macOS Apple Silicon runs the **image model on MPS** (no CUDA). Force CPU if you hit MPS op errors: `SAM3_DEVICE=cpu uv run python app.py`. CUDA Linux servers use the `cu126` index (`--index-url https://download.pytorch.org/whl/cu126`) for torch. CPU works but is slow. ~6–8 GB VRAM recommended.
+- **Browser launch**: `open_browser` in `app.py` detects installed Chromium browsers per platform (Windows exe paths; macOS `/Applications/*.app/Contents/MacOS/*`; Linux falls back to `webbrowser.open`) and opens in `--app` mode.
 - **Package manager**: **uv** with lockfile `uv.lock`. No pip/Pipfile/poetry.
 - **No linter/formatter config at root**. When editing SAM3 vendor code, follow its black/ruff/usort conventions.
 

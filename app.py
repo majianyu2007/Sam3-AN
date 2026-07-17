@@ -920,14 +920,22 @@ def open_browser(url):
 
     print("[INFO] 服务已就绪，正在打开浏览器...")
 
-    # 尝试不同的浏览器路径
-    chrome_paths = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]
+    # 按平台选择已安装的 Chromium 内核浏览器（用于 --app 独立窗口模式）
+    chrome_paths = []
+    if sys.platform == "win32":
+        chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+    elif sys.platform == "darwin":
+        chrome_paths = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
 
     browser_path = None
     for path in chrome_paths:
@@ -946,6 +954,7 @@ def open_browser(url):
         ])
         print(f"[INFO] 已在独立窗口中打开: {url}")
     else:
+        # 其他平台（Linux 等）或未检测到 Chrome/Edge，使用系统默认浏览器
         webbrowser.open(url)
         print(f"[INFO] 已在默认浏览器中打开: {url}")
 
@@ -962,18 +971,40 @@ def exit_app():
     return jsonify({'success': True})
 
 
+def _find_available_port(preferred=(5000, 5001, 5055, 8000, 8080)):
+    """选择可用端口。
+
+    macOS Sonoma/Sequoia 默认占用 5000 端口（AirPlay Receiver），按候选顺序
+    回退；全部占用时让操作系统分配空闲端口。
+    """
+    import socket
+    for port in preferred:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("0.0.0.0", port))
+                return port
+        except OSError:
+            continue
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("0.0.0.0", 0))
+        return s.getsockname()[1]
+
+
 if __name__ == '__main__':
     print("=" * 50)
     print("SAM3 AN - 数据标注工具")
     print("=" * 50)
 
     # 在后台线程中等待服务就绪后打开浏览器
-    url = "http://localhost:5000"
-    threading.Thread(target=open_browser, args=(url,), daemon=True).start()
+    port = _find_available_port()
+    url = f"http://localhost:{port}"
+    if port != 5000:
+        print(f"[INFO] 默认端口 5000 被占用（macOS AirPlay Receiver 常见），改用端口 {port}")
 
     print(f"[INFO] 正在启动服务器...")
     print(f"[INFO] 服务就绪后将自动打开浏览器")
     print("=" * 50)
 
     # 启动Flask服务器（关闭debug模式以避免重复打开浏览器）
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)

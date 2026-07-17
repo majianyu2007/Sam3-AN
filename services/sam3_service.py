@@ -15,6 +15,30 @@ sam3_src = Path(__file__).parent.parent / "SAM_src"
 sys.path.insert(0, str(sam3_src))
 
 
+def _select_device() -> str:
+    """选择推理设备：CUDA > MPS (macOS Apple Silicon) > CPU。
+
+    可通过环境变量 SAM3_DEVICE 强制指定（cuda/mps/cpu），便于在 MPS 算子
+    不支持时回退到 CPU。
+    """
+    env = os.environ.get("SAM3_DEVICE", "").strip().lower()
+    if env in ("cuda", "mps", "cpu"):
+        if env == "cuda" and not torch.cuda.is_available():
+            print("[WARN] SAM3_DEVICE=cuda 但未检测到 CUDA，回退到 CPU")
+            return "cpu"
+        if env == "mps" and not (
+            getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+        ):
+            print("[WARN] SAM3_DEVICE=mps 但未检测到 MPS，回退到 CPU")
+            return "cpu"
+        return env
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class SAM3Service:
     """SAM3模型服务"""
 
@@ -34,15 +58,28 @@ class SAM3Service:
 
         print("正在加载SAM3图像模型...")
 
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
         from sam3 import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
 
+        # 选择运行设备：CUDA > MPS (macOS) > CPU
+        # 可通过环境变量 SAM3_DEVICE 强制指定（如遇 MPS 算子不支持时设为 cpu）
+        self.device = _select_device()
+        print(f"[INFO] 使用设备: {self.device}")
+
         bpe_path = sam3_src / "assets" / "bpe_simple_vocab_16e6.txt.gz"
-        self.image_model = build_sam3_image_model(bpe_path=str(bpe_path))
-        self.image_processor = Sam3Processor(self.image_model)
+        # 工厂仅在 device=="cuda" 时迁移模型；MPS 需传入 cpu 再手动迁移，避免
+        # _setup_device_and_mode 忽略非 cuda 设备导致模型留 CPU
+        self.image_model = build_sam3_image_model(
+            bpe_path=str(bpe_path),
+            device="cpu" if self.device == "mps" else self.device,
+        )
+        if self.device == "mps":
+            self.image_model = self.image_model.to(self.device)
+        self.image_processor = Sam3Processor(self.image_model, device=self.device)
 
         print("SAM3图像模型加载完成")
 
