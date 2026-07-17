@@ -5,6 +5,8 @@
 // 全局状态
 const state = {
     projectId: null,
+    imageDir: '',
+    outputDir: '',
     images: [],
     currentIndex: 0,
     annotations: [],
@@ -43,14 +45,83 @@ const colors = [
     '#f472b6', '#22d3d8', '#fb923c', '#84cc16', '#6366f1'
 ];
 
-// 初始化
-document.addEventListener('DOMContentLoaded', () => {
+async function apiRequest(url, options = {}) {
+    const response = await fetch(url, options);
+    let data;
+    try {
+        data = await response.json();
+    } catch {
+        throw new Error(`服务返回了无法解析的响应（HTTP ${response.status}）`);
+    }
+    if (!response.ok || data.success === false) {
+        throw new Error(data.error || `请求失败（HTTP ${response.status}）`);
+    }
+    return data;
+}
+
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+    })[char]);
+}
+
+function formatBytes(bytes) {
+    if (!bytes) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    return `${(bytes / (1024 ** index)).toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
+}
+
+async function loadRuntimeStatus() {
+    const element = document.getElementById('runtimeStatus');
+    try {
+        const status = await apiRequest('/api/system/status');
+        const ready = status.checkpoint_ready;
+        element.className = `runtime-status ${ready ? 'ready' : 'warning'}`;
+        element.querySelector('span:last-child').textContent =
+            `${status.device_label} · ${ready ? formatBytes(status.checkpoint_size) : '缺少 sam3.pt'}`;
+        element.title = [
+            `Python ${status.python_version}`,
+            `设备: ${status.device_label}`,
+            `权重: ${status.checkpoint_path}`
+        ].join('\n');
+    } catch (error) {
+        element.className = 'runtime-status error';
+        element.querySelector('span:last-child').textContent = '运行环境检测失败';
+        element.title = error.message;
+    }
+}
+
+async function chooseDirectory(inputId, purpose) {
+    const input = document.getElementById(inputId);
+    if (!input) return;
+    try {
+        const data = await apiRequest('/api/system/select-directory', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ purpose })
+        });
+        if (!data.canceled && data.path) {
+            input.value = data.path;
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    } catch (error) {
+        showToast('目录选择失败', error.message, 'danger');
+    }
+}
+
+// 初始化：先绑定 UI，再按顺序恢复服务端与本地状态。
+document.addEventListener('DOMContentLoaded', async () => {
     initCanvas();
     initEventListeners();
-    loadProjects();
-    restoreWorkState();  // 恢复上次工作状态
-    restorePanelState(); // 恢复面板折叠状态
-    handleResponsiveCollapse(); // 初始化响应式
+    restorePanelState();
+    handleResponsiveCollapse();
+    await Promise.all([loadRuntimeStatus(), loadProjects()]);
+    await restoreWorkState();
 });
 
 // 保存工作状态到localStorage
@@ -62,7 +133,6 @@ function saveWorkState() {
             timestamp: Date.now()
         };
         localStorage.setItem('sam3_work_state', JSON.stringify(workState));
-        console.log('[DEBUG] 工作状态已保存:', workState);
     }
 }
 
@@ -73,55 +143,51 @@ async function restoreWorkState() {
 
     try {
         const workState = JSON.parse(saved);
-        console.log('[DEBUG] 恢复工作状态:', workState);
-
-        // 恢复项目
-        if (workState.projectId) {
-            const success = await selectProject(workState.projectId);
-
-            if (success) {
-                // 自动扫描文件夹更新图片列表
-                await rescanProjectImages();
-
-                // 恢复图片位置
-                if (workState.currentIndex >= 0 && workState.currentIndex < state.images.length) {
-                    loadImage(workState.currentIndex);
-                } else if (state.images.length > 0) {
-                    loadImage(0);
-                }
-            }
+        if (!workState.projectId) return;
+        const success = await selectProject(workState.projectId);
+        if (!success) {
+            localStorage.removeItem('sam3_work_state');
+            return;
         }
-    } catch (e) {
-        console.error('恢复工作状态失败:', e);
+        await rescanProjectImages();
+        if (state.images.length > 0) {
+            const index = Math.min(
+                Math.max(Number(workState.currentIndex) || 0, 0),
+                state.images.length - 1
+            );
+            loadImage(index);
+        }
+    } catch (error) {
+        localStorage.removeItem('sam3_work_state');
+        console.error('恢复工作状态失败:', error);
+        showToast('恢复失败', error.message, 'danger');
     }
 }
 
 // 重新扫描项目图片文件夹
-async function rescanProjectImages() {
-    if (!state.projectId) return;
-
+async function rescanProjectImages({ notify = false } = {}) {
+    if (!state.projectId) return false;
     try {
-        const response = await fetch(`/api/project/${state.projectId}`);
-        const data = await response.json();
-
-        if (data.success && data.project.image_dir) {
-            console.log('[DEBUG] 扫描文件夹:', data.project.image_dir);
-
-            const scanResponse = await fetch(`/api/project/${state.projectId}/load_images`, {
+        const data = await apiRequest(`/api/project/${state.projectId}`);
+        if (!data.project.image_dir) return true;
+        const scanData = await apiRequest(
+            `/api/project/${state.projectId}/load_images`,
+            {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ image_dir: data.project.image_dir })
-            });
-
-            const scanData = await scanResponse.json();
-            if (scanData.success) {
-                state.images = scanData.images;
-                updateImageList();
-                console.log(`[DEBUG] 扫描完成: ${scanData.count} 张图片`);
             }
+        );
+        state.images = scanData.images;
+        updateImageList();
+        if (notify) {
+            showToast('扫描完成', `找到 ${scanData.count} 张图片`);
         }
-    } catch (e) {
-        console.error('扫描文件夹失败:', e);
+        return true;
+    } catch (error) {
+        console.error('扫描文件夹失败:', error);
+        showToast('图片目录不可用', error.message, 'danger');
+        return false;
     }
 }
 
@@ -131,16 +197,24 @@ async function clearCurrentAnnotations() {
         showToast('提示', '当前没有标注');
         return;
     }
+    if (!confirm(`确定要清除当前图片的 ${state.annotations.length} 个标注吗？`)) {
+        return;
+    }
 
-    if (confirm(`确定要清除当前图片的 ${state.annotations.length} 个标注吗？`)) {
-        state.annotations = [];
-        state.selectedAnnotation = null;
-        invalidateStaticCache();  // 标注变化，更新缓存
+    const previous = state.annotations;
+    state.annotations = [];
+    state.selectedAnnotation = null;
+    invalidateStaticCache();
+    updateAnnotationList();
+    redraw();
+    if (await saveAnnotations(false)) {
+        showToast('成功', '已清除并写入磁盘');
+    } else {
+        state.annotations = previous;
+        invalidateStaticCache();
         updateAnnotationList();
         redraw();
-        // 自动保存
-        await saveAnnotations(false);
-        showToast('成功', '已清除并保存');
+        showToast('清除已撤销', '保存失败，原标注已恢复', 'warning');
     }
 }
 
@@ -1034,96 +1108,91 @@ function clearTempPrompts() {
     showToast('提示', '已清除临时标记');
 }
 
+async function applySegmentationResults(results, className, emptyMessage, successMessage) {
+    if (!Array.isArray(results) || results.length === 0) {
+        showToast('未检测到对象', emptyMessage, 'warning');
+        return false;
+    }
+    results.forEach(result => {
+        result.class_name = className;
+    });
+    state.annotations.push(...results);
+    invalidateStaticCache();
+    updateAnnotationList();
+    redraw();
+    const saved = await saveAnnotations(false);
+    if (saved) {
+        showToast('成功', successMessage);
+    } else {
+        showToast('分割完成但未保存', '结果仍保留在当前页面，请重试“保存”', 'warning');
+    }
+    return true;
+}
+
+
 async function segmentByPoints() {
     if (!state.projectId || state.currentIndex < 0) return;
-
-    // 检查类别
     const className = getCurrentClassName();
     if (!className) return;
 
     const image = state.images[state.currentIndex];
-    const points = state.tempPoints.map(p => [p.x, p.y, p.label ? 1 : 0]);
-
+    const points = state.tempPoints.map(point => [
+        point.x,
+        point.y,
+        point.label ? 1 : 0
+    ]);
     showLoading('正在分割...');
-
     try {
-        const response = await fetch('/api/segment/point', {
+        const data = await apiRequest('/api/segment/point', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                image_path: image.path,
-                points: points
-            })
+            body: JSON.stringify({ image_path: image.path, points })
         });
-
-        const data = await response.json();
-        if (data.success && data.results.length > 0) {
-            data.results.forEach(r => r.class_name = className);
-
-            state.annotations.push(...data.results);
-            state.tempPoints = [];
-            invalidateStaticCache();  // 标注变化，更新缓存
-            updateAnnotationList();
-            redraw();
-            await saveAnnotations(false);  // 自动保存
-            showToast('成功', `检测到 ${data.results.length} 个 "${className}"`);
-        } else {
-            showToast('提示', '未检测到对象');
-        }
+        const applied = await applySegmentationResults(
+            data.results,
+            className,
+            '请调整正负提示点后重试',
+            `检测到 ${data.results.length} 个 \"${className}\"`
+        );
+        if (applied) state.tempPoints = [];
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('点击分割失败', error.message, 'danger');
+    } finally {
+        hideLoading();
     }
-
-    hideLoading();
 }
 
 async function segmentByBoxes(boxes) {
     if (!state.projectId || state.currentIndex < 0) return;
-
-    // 检查类别
     const className = getCurrentClassName();
     if (!className) return;
 
     const image = state.images[state.currentIndex];
-
-    // 转换框数据，每个框使用自己存储的 label
-    const boxData = boxes.map(box => [box.x1, box.y1, box.x2, box.y2, box.label ? 1 : 0]);
-
-    // 统计正负样本数量
-    const positiveCount = boxes.filter(b => b.label).length;
-    const negativeCount = boxes.length - positiveCount;
-    console.log(`[DEBUG] 分割框: 正样本=${positiveCount}, 负样本=${negativeCount}`);
-
+    const boxData = boxes.map(box => [
+        box.x1,
+        box.y1,
+        box.x2,
+        box.y2,
+        box.label ? 1 : 0
+    ]);
     showLoading('正在分割...');
-
     try {
-        const response = await fetch('/api/segment/box', {
+        const data = await apiRequest('/api/segment/box', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                image_path: image.path,
-                boxes: boxData
-            })
+            body: JSON.stringify({ image_path: image.path, boxes: boxData })
         });
-
-        const data = await response.json();
-        if (data.success && data.results.length > 0) {
-            data.results.forEach(r => r.class_name = className);
-
-            state.annotations.push(...data.results);
-            invalidateStaticCache();  // 标注变化，更新缓存
-            updateAnnotationList();
-            redraw();
-            await saveAnnotations(false);  // 自动保存
-            showToast('成功', `检测到 ${data.results.length} 个 "${className}"`);
-        } else {
-            showToast('提示', '未检测到对象');
-        }
+        await applySegmentationResults(
+            data.results,
+            className,
+            '请调整正负提示框后重试',
+            `检测到 ${data.results.length} 个 \"${className}\"`
+        );
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('框选分割失败', error.message, 'danger');
+    } finally {
+        hideLoading();
     }
-
-    hideLoading();
 }
 
 // 获取当前选中的类名
@@ -1217,12 +1286,12 @@ function showClassSelectModal(prompt) {
                         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
                     <div class="modal-body">
-                        <p class="small text-muted mb-3">提示词 "${prompt}" 未匹配到类别，请选择：</p>
+                        <p class="small text-muted mb-3">提示词 "${escapeHtml(prompt)}" 未匹配到类别，请选择：</p>
                         <div class="class-select-list">
-                            ${state.classes.map((cls, idx) => `
+                            ${state.classes.map(cls => `
                                 <button class="btn btn-outline-primary w-100 mb-2 class-select-btn"
-                                        data-class="${cls}" data-prompt="${prompt}">
-                                    ${cls}
+                                        data-class="${escapeHtml(cls)}" data-prompt="${escapeHtml(prompt)}">
+                                    ${escapeHtml(cls)}
                                 </button>
                             `).join('')}
                         </div>
@@ -1256,27 +1325,22 @@ function showClassSelectModal(prompt) {
 // 执行文本分割
 async function executeTextSegment(prompt, className) {
     const image = state.images[state.currentIndex];
-
-    // 尝试AI翻译（如果启用）
     let actualPrompt = prompt;
     let wasTranslated = false;
 
-    if (aiConfig.enabled && aiConfig.apiUrl && aiConfig.apiKey) {
-        showLoading(`正在翻译: ${prompt}...`);
-        const translateResult = await translatePrompt(prompt);
-        if (translateResult.translated) {
-            actualPrompt = translateResult.text;
-            wasTranslated = true;
-            console.log(`[AI翻译] "${prompt}" -> "${actualPrompt}"`);
-        }
-    }
-
-    console.log('[DEBUG] segmentByText:', { image_path: image.path, prompt: actualPrompt, className, confidence: state.confidence });
-
-    showLoading(`正在分割: ${wasTranslated ? actualPrompt + ' (' + prompt + ')' : prompt}...`);
-
     try {
-        const response = await fetch('/api/segment/text', {
+        if (aiConfig.enabled && aiConfig.apiUrl && aiConfig.apiKey) {
+            showLoading(`正在翻译: ${prompt}...`);
+            const translateResult = await translatePrompt(prompt);
+            if (translateResult.translated) {
+                actualPrompt = translateResult.text;
+                wasTranslated = true;
+            }
+        }
+        showLoading(
+            `正在分割: ${wasTranslated ? `${actualPrompt} (${prompt})` : prompt}...`
+        );
+        const data = await apiRequest('/api/segment/text', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1285,191 +1349,145 @@ async function executeTextSegment(prompt, className) {
                 confidence: state.confidence
             })
         });
-
-        const data = await response.json();
-        console.log('[DEBUG] segmentByText response:', data);
-
-        if (data.success) {
-            if (data.results && data.results.length > 0) {
-                console.log('[DEBUG] Found results:', data.results);
-                // 使用匹配的类名，而不是提示词
-                data.results.forEach(r => r.class_name = className);
-                state.annotations.push(...data.results);
-                invalidateStaticCache();  // 标注变化，更新缓存
-                updateAnnotationList();
-                redraw();
-                await saveAnnotations(false);  // 自动保存
-                const msg = wasTranslated
-                    ? `检测到 ${data.results.length} 个 "${className}" (翻译: ${actualPrompt})`
-                    : `检测到 ${data.results.length} 个 "${className}"`;
-                showToast('成功', msg);
-            } else {
-                const msg = wasTranslated
-                    ? `未检测到 "${prompt}" (翻译: ${actualPrompt})`
-                    : `未检测到 "${prompt}"`;
-                showToast('提示', msg);
-            }
-        }
+        const suffix = wasTranslated ? `（翻译: ${actualPrompt}）` : '';
+        await applySegmentationResults(
+            data.results,
+            className,
+            `未检测到 \"${prompt}\"${suffix}`,
+            `检测到 ${data.results.length} 个 \"${className}\"${suffix}`
+        );
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('文本分割失败', error.message, 'danger');
+    } finally {
+        hideLoading();
     }
-
-    hideLoading();
 }
 
 async function batchSegment() {
-    if (!state.projectId) {
-        showToast('提示', '请先选择项目');
+    if (!state.projectId || state.images.length === 0) {
+        showToast('提示', '请先选择包含图片的项目', 'warning');
         return;
     }
-
-    // 检查类别
     if (state.classes.length === 0) {
-        showToast('提示', '请先在类别管理中添加类名');
+        showToast('提示', '请先在类别管理中添加类名', 'warning');
         return;
     }
 
     const prompt = document.getElementById('textPrompt').value.trim();
     if (!prompt) {
-        showToast('提示', '请输入提示词');
+        showToast('提示', '请输入提示词', 'warning');
         return;
     }
-
-    // 匹配类名
     let className = findMatchingClass(prompt);
     if (!className) {
-        if (state.classes.length === 1) {
-            className = state.classes[0];
-        } else if (state.currentClass) {
-            className = state.currentClass;
-        } else {
-            showToast('提示', `提示词 "${prompt}" 未匹配到类别，请先选择一个类别`);
-            return;
-        }
+        className = state.classes.length === 1
+            ? state.classes[0]
+            : state.currentClass;
     }
-
-    const startIndex = parseInt(document.getElementById('batchStart').value) || 0;
-    const endIndex = parseInt(document.getElementById('batchEnd').value) || -1;
-    const skipAnnotated = document.getElementById('skipAnnotated').checked;
-
-    // 计算要处理的图片数量
-    const totalImages = state.images.length;
-    const actualEnd = endIndex === -1 ? totalImages : Math.min(endIndex, totalImages);
-
-    // 构建待处理列表
-    const toProcessList = [];
-    for (let i = startIndex; i < actualEnd; i++) {
-        if (skipAnnotated && state.images[i].annotated) continue;
-        toProcessList.push(i);
-    }
-
-    if (toProcessList.length === 0) {
-        showToast('提示', '没有需要处理的图片');
+    if (!className) {
+        showToast('提示', `提示词 \"${prompt}\" 未匹配到类别，请先选择类别`, 'warning');
         return;
     }
 
-    // 尝试AI翻译（如果启用）
+    const startIndex = Math.max(parseInt(document.getElementById('batchStart').value) || 0, 0);
+    const rawEnd = parseInt(document.getElementById('batchEnd').value);
+    const endIndex = Number.isFinite(rawEnd) && rawEnd >= 0
+        ? Math.min(rawEnd, state.images.length)
+        : state.images.length;
+    const skipAnnotated = document.getElementById('skipAnnotated').checked;
+    const toProcess = [];
+    for (let index = startIndex; index < endIndex; index++) {
+        if (!skipAnnotated || !state.images[index].annotated) toProcess.push(index);
+    }
+    if (toProcess.length === 0) {
+        showToast('提示', '没有需要处理的图片', 'warning');
+        return;
+    }
+
     let actualPrompt = prompt;
     let wasTranslated = false;
-
     if (aiConfig.enabled && aiConfig.apiUrl && aiConfig.apiKey) {
         showLoading(`正在翻译: ${prompt}...`);
         const translateResult = await translatePrompt(prompt);
         if (translateResult.translated) {
             actualPrompt = translateResult.text;
             wasTranslated = true;
-            console.log(`[AI翻译] "${prompt}" -> "${actualPrompt}"`);
         }
     }
-
-    // 确认操作
-    const confirmMsg = wasTranslated
-        ? `即将对 ${toProcessList.length} 张图片进行批量分割\n类别: ${className}\n提示词: ${prompt}\n翻译后: ${actualPrompt}\n\n确定继续？`
-        : `即将对 ${toProcessList.length} 张图片进行批量分割\n类别: ${className}\n提示词: ${prompt}\n\n确定继续？`;
-
-    if (!confirm(confirmMsg)) {
+    const translation = wasTranslated ? `\n翻译后: ${actualPrompt}` : '';
+    if (!confirm(
+        `即将处理 ${toProcess.length} 张图片\n类别: ${className}\n提示词: ${prompt}${translation}\n\n确定继续？`
+    )) {
+        hideLoading();
         return;
     }
 
-    // 开始批量处理，实时更新进度
     let processed = 0;
-    let failed = 0;
     let totalDetections = 0;
-
-    showLoading(`正在批量分割... 0/${toProcessList.length}`, 0);
-
-    for (let i = 0; i < toProcessList.length; i++) {
-        const imgIndex = toProcessList[i];
-        const img = state.images[imgIndex];
-
-        // 更新进度
-        const progress = (i / toProcessList.length) * 100;
-        showLoading(`正在处理: ${img.filename} (${i + 1}/${toProcessList.length})`, progress);
-
-        try {
-            const respAnnotation = await fetch("/api/annotation/get?project_id="+encodeURIComponent(state.projectId)+"&image_index="+imgIndex, 
-            {
-                method: 'GET',
-                headers: { 'Content-Type': 'application/json' }
-            });
-            const data1 = await respAnnotation.json();
-            const currentAnnotation = data1.annotations;
-                console.log(currentAnnotation)
-            const response = await fetch('/api/segment/text', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    image_path: img.path,
-                    prompt: actualPrompt,
-                    confidence: state.confidence
-                })
-            });
-
-            const data = await response.json();
-            if (data.success && data.results && data.results.length > 0) {
-                // 设置类名
-                data.results.forEach(r => r.class_name = className);
-                data.results = data.results.concat(currentAnnotation)
-                console.log(data.results)
-                // 保存标注
-                await fetch('/api/annotation/save', {
+    const failures = [];
+    showLoading(`正在批量分割... 0/${toProcess.length}`, 0);
+    try {
+        for (let offset = 0; offset < toProcess.length; offset++) {
+            const imageIndex = toProcess[offset];
+            const image = state.images[imageIndex];
+            showLoading(
+                `正在处理: ${image.filename} (${offset + 1}/${toProcess.length})`,
+                (offset / toProcess.length) * 100
+            );
+            try {
+                const current = await apiRequest(
+                    `/api/annotation/get?project_id=${encodeURIComponent(state.projectId)}&image_index=${imageIndex}`
+                );
+                const segmented = await apiRequest('/api/segment/text', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        project_id: state.projectId,
-                        image_index: imgIndex,
-                        annotations: data.results
+                        image_path: image.path,
+                        prompt: actualPrompt,
+                        confidence: state.confidence
                     })
                 });
-
-                // 更新本地状态
-                state.images[imgIndex].annotations = data.results;
-                state.images[imgIndex].annotated = true;
-                totalDetections += data.results.length;
+                const newResults = segmented.results || [];
+                newResults.forEach(result => {
+                    result.class_name = className;
+                });
+                if (newResults.length > 0) {
+                    const annotations = [...current.annotations, ...newResults];
+                    await apiRequest('/api/annotation/save', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            project_id: state.projectId,
+                            image_index: imageIndex,
+                            annotations
+                        })
+                    });
+                    state.images[imageIndex].annotations = annotations;
+                    state.images[imageIndex].annotated = true;
+                }
+                totalDetections += newResults.length;
+                processed++;
+            } catch (error) {
+                failures.push(`${image.filename}: ${error.message}`);
             }
-            processed++;
-        } catch (error) {
-            console.error(`处理图片 ${img.filename} 失败:`, error);
-            failed++;
         }
+    } finally {
+        updateLoadingProgress(100);
+        hideLoading();
     }
 
-    // 完成
-    updateLoadingProgress(100);
-    hideLoading();
-
-    const msg = `处理完成!\n成功: ${processed} 张\n检测到: ${totalDetections} 个对象`;
-    if (failed > 0) {
-        showToast('警告', msg + `\n失败: ${failed} 张`, 'warning');
+    const summary = `完成 ${processed}/${toProcess.length} 张，新检测 ${totalDetections} 个对象`;
+    if (failures.length > 0) {
+        showToast(
+            '批量分割部分失败',
+            `${summary}；失败 ${failures.length} 张：${failures.slice(0, 2).join('；')}`,
+            'warning'
+        );
     } else {
-        showToast('成功', msg);
+        showToast('批量分割完成', summary);
     }
-
-    // 刷新显示
     updateImageList();
-    if (state.currentIndex >= 0) {
-        loadImage(state.currentIndex);
-    }
+    if (state.currentIndex >= 0) loadImage(state.currentIndex);
 }
 
 // ==================== 项目管理 ====================
@@ -1480,37 +1498,61 @@ function showProjectModal() {
 }
 
 async function loadProjects() {
+    const list = document.getElementById('projectList');
     try {
-        const response = await fetch('/api/project/list');
-        const data = await response.json();
-
-        const list = document.getElementById('projectList');
+        const data = await apiRequest('/api/project/list');
         if (data.projects.length === 0) {
             list.innerHTML = '<div class="text-muted p-3">暂无项目</div>';
-            return;
+            return [];
         }
 
-        list.innerHTML = data.projects.map(p => `
-            <div class="list-group-item project-item">
-                <div class="project-item-main" onclick="selectProject('${p.id}')">
+        list.innerHTML = data.projects.map(project => `
+            <div class="list-group-item project-item" data-project-id="${escapeHtml(project.id)}">
+                <div class="project-item-main">
                     <div class="d-flex justify-content-between align-items-center">
-                        <strong>${p.name}</strong>
-                        <small class="text-muted">${p.images?.length || 0} 张图片</small>
+                        <strong>${escapeHtml(project.name)}</strong>
+                        <small class="text-muted">${project.images?.length || 0} 张图片</small>
                     </div>
-                    <small class="text-muted">${p.image_dir || '未设置目录'}</small>
+                    <small class="text-muted">${escapeHtml(project.image_dir || '未设置目录')}</small>
                 </div>
                 <div class="project-item-actions">
-                    <button class="btn btn-sm btn-outline-primary" onclick="event.stopPropagation(); showEditProjectModal('${p.id}')" title="编辑">
+                    <button class="btn btn-sm btn-outline-primary edit-project" title="编辑">
                         <i class="bi bi-pencil"></i>
                     </button>
-                    <button class="btn btn-sm btn-outline-danger" onclick="event.stopPropagation(); deleteProject('${p.id}', '${p.name}')" title="删除">
+                    <button class="btn btn-sm btn-outline-danger delete-project"
+                            data-project-name="${escapeHtml(project.name)}" title="删除">
                         <i class="bi bi-trash"></i>
                     </button>
                 </div>
             </div>
         `).join('');
+
+        list.querySelectorAll('.project-item').forEach(item => {
+            const projectId = item.dataset.projectId;
+            item.querySelector('.project-item-main').addEventListener(
+                'click',
+                () => selectProject(projectId)
+            );
+            item.querySelector('.edit-project').addEventListener(
+                'click',
+                event => {
+                    event.stopPropagation();
+                    showEditProjectModal(projectId);
+                }
+            );
+            item.querySelector('.delete-project').addEventListener(
+                'click',
+                event => {
+                    event.stopPropagation();
+                    deleteProject(projectId, event.currentTarget.dataset.projectName);
+                }
+            );
+        });
+        return data.projects;
     } catch (error) {
-        console.error('加载项目失败:', error);
+        list.innerHTML = '<div class="text-danger p-3">项目列表加载失败</div>';
+        showToast('加载项目失败', error.message, 'danger');
+        return [];
     }
 }
 
@@ -1520,68 +1562,51 @@ let editingProjectId = null;
 // 显示编辑项目模态框
 async function showEditProjectModal(projectId) {
     try {
-        const response = await fetch(`/api/project/${projectId}`);
-        const data = await response.json();
-
-        if (!data.success) {
-            showToast('错误', data.error, 'danger');
-            return;
-        }
-
+        const data = await apiRequest(`/api/project/${projectId}`);
         const project = data.project;
         editingProjectId = projectId;
 
-        // 切换到新建项目标签页（复用表单）
         const tab = document.querySelector('a[href="#newProject"]');
-        if (tab) {
-            new bootstrap.Tab(tab).show();
-        }
-
-        // 填充表单
+        if (tab) new bootstrap.Tab(tab).show();
         document.getElementById('newProjectName').value = project.name || '';
         document.getElementById('newProjectImageDir').value = project.image_dir || '';
         document.getElementById('newProjectOutputDir').value = project.output_dir || '';
-        document.getElementById('newProjectClasses').value = (project.classes || []).join(', ');
+        document.getElementById('newProjectClasses').value =
+            (project.classes || []).join(', ');
 
-        // 修改按钮文字
         const createBtn = document.querySelector('#newProject button.btn-primary');
         if (createBtn) {
             createBtn.innerHTML = '<i class="bi bi-check-lg"></i> 保存修改';
             createBtn.onclick = updateProject;
         }
-
-        // 修改标签页标题
-        const tabLink = document.querySelector('a[href="#newProject"]');
-        if (tabLink) {
-            tabLink.textContent = '编辑项目';
-        }
-
+        if (tab) tab.textContent = '编辑项目';
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('读取项目失败', error.message, 'danger');
     }
 }
 
 // 更新项目
 async function updateProject() {
     if (!editingProjectId) {
-        createProject();
+        await createProject();
         return;
     }
 
     const name = document.getElementById('newProjectName').value.trim();
     const imageDir = document.getElementById('newProjectImageDir').value.trim();
     const outputDir = document.getElementById('newProjectOutputDir').value.trim();
-    const classesStr = document.getElementById('newProjectClasses').value.trim();
-
+    const classes = document.getElementById('newProjectClasses').value
+        .split(',')
+        .map(value => value.trim())
+        .filter(Boolean);
     if (!name) {
-        showToast('提示', '请输入项目名称');
+        showToast('提示', '请输入项目名称', 'warning');
         return;
     }
 
-    const classes = classesStr ? classesStr.split(',').map(c => c.trim()).filter(c => c) : [];
-
     try {
-        const response = await fetch(`/api/project/${editingProjectId}/update`, {
+        const projectId = editingProjectId;
+        const data = await apiRequest(`/api/project/${projectId}/update`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1592,72 +1617,60 @@ async function updateProject() {
             })
         });
 
-        const data = await response.json();
-        if (data.success) {
-            showToast('成功', '项目已更新');
-
-            // 如果是当前项目，更新显示
-            if (state.projectId === editingProjectId) {
-                document.getElementById('projectName').textContent = name;
-                state.classes = classes;
-                updateClassList();
+        if (state.projectId === projectId) {
+            const directoryChanged = state.imageDir !== data.project.image_dir;
+            state.imageDir = data.project.image_dir || '';
+            state.outputDir = data.project.output_dir || '';
+            state.classes = data.project.classes || [];
+            document.getElementById('projectName').textContent = data.project.name;
+            document.getElementById('exportOutputDir').value = state.outputDir;
+            updateClassList();
+            if (directoryChanged) {
+                await rescanProjectImages({ notify: true });
+                if (state.images.length > 0) loadImage(0);
             }
-
-            // 重置编辑状态
-            resetProjectForm();
-            loadProjects();
-        } else {
-            showToast('错误', data.error, 'danger');
         }
+
+        resetProjectForm();
+        await loadProjects();
+        bootstrap.Modal.getInstance(document.getElementById('projectModal'))?.hide();
+        showToast('成功', '项目已更新');
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('更新项目失败', error.message, 'danger');
     }
 }
 
 // 删除项目
 async function deleteProject(projectId, projectName) {
-    if (!confirm(`确定要删除项目 "${projectName}" 吗？\n\n此操作将删除项目及其所有标注数据，不可恢复！`)) {
+    if (!confirm(`确定要删除项目 \"${projectName}\" 吗？\n\n此操作将删除项目及其所有标注数据，不可恢复！`)) {
         return;
     }
-
     try {
-        const response = await fetch(`/api/project/${projectId}/delete`, {
+        await apiRequest(`/api/project/${projectId}/delete`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
         });
-
-        const data = await response.json();
-        if (data.success) {
-            showToast('成功', '项目已删除');
-
-            // 如果删除的是当前项目，清空状态
-            if (state.projectId === projectId) {
-                state.projectId = null;
-                state.images = [];
-                state.annotations = [];
-                state.classes = [];
-                state.currentIndex = 0;
-                document.getElementById('projectName').textContent = '未选择项目';
-                updateImageList();
-                updateClassList();
-                updateAnnotationList();
-                localStorage.removeItem('sam3_work_state');
-
-                // 清空画布
-                if (currentImage) {
-                    currentImage = null;
-                    const canvas = document.getElementById('annotationCanvas');
-                    const ctx = canvas.getContext('2d');
-                    ctx.clearRect(0, 0, canvas.width, canvas.height);
-                }
-            }
-
-            loadProjects();
-        } else {
-            showToast('错误', data.error, 'danger');
+        if (state.projectId === projectId) {
+            state.projectId = null;
+            state.imageDir = '';
+            state.outputDir = '';
+            state.images = [];
+            state.annotations = [];
+            state.classes = [];
+            state.currentClass = null;
+            state.currentIndex = 0;
+            currentImage = null;
+            document.getElementById('projectName').textContent = '未选择项目';
+            updateImageList();
+            updateClassList();
+            updateAnnotationList();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            localStorage.removeItem('sam3_work_state');
         }
+        await loadProjects();
+        showToast('成功', '项目已删除');
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('删除项目失败', error.message, 'danger');
     }
 }
 
@@ -1692,99 +1705,114 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 async function createProject() {
-    // 如果是编辑模式，调用更新函数
     if (editingProjectId) {
-        updateProject();
+        await updateProject();
         return;
     }
 
     const name = document.getElementById('newProjectName').value.trim();
     const imageDir = document.getElementById('newProjectImageDir').value.trim();
     const outputDir = document.getElementById('newProjectOutputDir').value.trim();
-    const classesStr = document.getElementById('newProjectClasses').value.trim();
-
+    const classes = document.getElementById('newProjectClasses').value
+        .split(',')
+        .map(value => value.trim())
+        .filter(Boolean);
     if (!name) {
-        showToast('提示', '请输入项目名称');
+        showToast('提示', '请输入项目名称', 'warning');
         return;
     }
 
-    const classes = classesStr ? classesStr.split(',').map(c => c.trim()).filter(c => c) : [];
-
     try {
-        const response = await fetch('/api/project/create', {
+        const data = await apiRequest('/api/project/create', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, image_dir: imageDir, output_dir: outputDir, classes })
+            body: JSON.stringify({
+                name,
+                image_dir: imageDir,
+                output_dir: outputDir,
+                classes
+            })
         });
-
-        const data = await response.json();
-        if (data.success) {
-            showToast('成功', '项目创建成功');
-            await selectProject(data.project.id);
-
-            if (imageDir) {
-                await loadProjectImages();
-            }
-
-            bootstrap.Modal.getInstance(document.getElementById('projectModal')).hide();
+        await selectProject(data.project.id);
+        if (data.project.image_dir) {
+            await rescanProjectImages();
+            if (state.images.length > 0) loadImage(0);
         }
+        bootstrap.Modal.getInstance(document.getElementById('projectModal'))?.hide();
+        showToast(
+            '项目创建成功',
+            state.images.length > 0
+                ? `已加载 ${state.images.length} 张图片`
+                : '尚未加载图片，请编辑项目并选择图片目录'
+        );
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('创建项目失败', error.message, 'danger');
     }
 }
 
 async function selectProject(projectId) {
     try {
-        const response = await fetch(`/api/project/${projectId}`);
-        const data = await response.json();
-
-        if (data.success) {
-            state.projectId = projectId;
-            state.classes = data.project.classes || [];
-            state.images = data.project.images || [];
-            state.currentIndex = 0;
-
-            document.getElementById('projectName').textContent = data.project.name;
-            document.getElementById('exportOutputDir').value = data.project.output_dir || '';
-
-            updateClassList();
-            updateImageList();
-
-            // 保存工作状态
-            saveWorkState();
-
-            bootstrap.Modal.getInstance(document.getElementById('projectModal'))?.hide();
-
-            // 返回 true 表示成功，供 restoreWorkState 使用
-            return true;
+        const data = await apiRequest(`/api/project/${projectId}`);
+        const project = data.project;
+        state.projectId = projectId;
+        state.imageDir = project.image_dir || '';
+        state.outputDir = project.output_dir || '';
+        state.classes = project.classes || [];
+        state.images = project.images || [];
+        state.currentIndex = Math.min(
+            Math.max(Number(project.current_index) || 0, 0),
+            Math.max(state.images.length - 1, 0)
+        );
+        if (!state.classes.includes(state.currentClass)) {
+            state.currentClass = state.classes[0] || null;
         }
+
+        document.getElementById('projectName').textContent = project.name;
+        document.getElementById('exportOutputDir').value = state.outputDir;
+        updateClassList();
+        updateImageList();
+        bootstrap.Modal.getInstance(document.getElementById('projectModal'))?.hide();
+
+        if (state.images.length > 0) {
+            loadImage(state.currentIndex);
+        } else {
+            state.annotations = [];
+            currentImage = null;
+            updateAnnotationList();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+        saveWorkState();
+        return true;
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('选择项目失败', error.message, 'danger');
+        return false;
     }
-    return false;
 }
 
-async function loadProjectImages() {
-    if (!state.projectId) return;
-
-    const imageDir = document.getElementById('newProjectImageDir').value.trim();
-    if (!imageDir) return;
-
+async function loadProjectImages(imageDir = state.imageDir) {
+    if (!state.projectId || !imageDir) return false;
     try {
-        const response = await fetch(`/api/project/${state.projectId}/load_images`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image_dir: imageDir })
-        });
-
-        const data = await response.json();
-        if (data.success) {
-            state.images = data.images;
-            updateImageList();
+        const data = await apiRequest(
+            `/api/project/${state.projectId}/load_images`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image_dir: imageDir })
+            }
+        );
+        state.imageDir = data.image_dir;
+        state.images = data.images;
+        updateImageList();
+        if (state.images.length > 0) {
+            loadImage(0);
             showToast('成功', `已加载 ${data.count} 张图片`);
+        } else {
+            showToast('图片目录为空', '没有找到支持的图片格式', 'warning');
         }
+        return true;
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('加载图片失败', error.message, 'danger');
+        return false;
     }
 }
 
@@ -1792,29 +1820,28 @@ async function loadProjectImages() {
 
 function updateImageList() {
     const list = document.getElementById('imageList');
-    const annotatedCount = state.images.filter(img => img.annotated).length;
+    const annotatedCount = state.images.filter(image => image.annotated).length;
     const total = state.images.length;
     const percent = total > 0 ? Math.round(annotatedCount / total * 100) : 0;
-
-    // 更新统计
     document.getElementById('imageStats').textContent = `${annotatedCount}/${total}`;
-
-    // 更新进度条
     document.getElementById('progressBar').style.width = `${percent}%`;
-    document.getElementById('progressText').textContent = `已标注: ${annotatedCount}/${total} (${percent}%)`;
+    document.getElementById('progressText').textContent =
+        `已标注: ${annotatedCount}/${total} (${percent}%)`;
 
     if (total === 0) {
         list.innerHTML = '<div class="empty-state"><i class="bi bi-images"></i><p>暂无图片</p></div>';
         return;
     }
-
-    list.innerHTML = state.images.map((img, idx) => `
-        <div class="image-item ${idx === state.currentIndex ? 'active' : ''} ${img.annotated ? 'annotated' : ''}"
-             onclick="loadImage(${idx})">
-            <span class="index">${idx + 1}</span>
-            <span class="filename">${img.filename}</span>
+    list.innerHTML = state.images.map((image, index) => `
+        <div class="image-item ${index === state.currentIndex ? 'active' : ''} ${image.annotated ? 'annotated' : ''}"
+             data-image-index="${index}">
+            <span class="index">${index + 1}</span>
+            <span class="filename">${escapeHtml(image.filename)}</span>
         </div>
     `).join('');
+    list.querySelectorAll('.image-item').forEach(item => {
+        item.addEventListener('click', () => loadImage(Number(item.dataset.imageIndex)));
+    });
 }
 
 function filterImages(query) {
@@ -1828,41 +1855,39 @@ function filterImages(query) {
 }
 
 async function loadImage(index) {
-    if (index < 0 || index >= state.images.length) return;
-
-    // 保存当前标注
-    if (state.currentIndex !== index && state.annotations.length > 0) {
-        await saveAnnotations(false);
+    if (index < 0 || index >= state.images.length) return false;
+    if (
+        state.currentIndex !== index &&
+        state.images[state.currentIndex] &&
+        !(await saveAnnotations(false))
+    ) {
+        showToast('未切换图片', '当前标注保存失败，请先解决保存问题', 'warning');
+        return false;
     }
 
     state.currentIndex = index;
-    state.annotations = [];
+    state.annotations = structuredClone(state.images[index].annotations || []);
     state.tempPoints = [];
     state.tempBoxes = [];
     state.selectedAnnotation = null;
-    invalidateStaticCache();  // 加载新图片，重置缓存
-
-    const image = state.images[index];
-
-    // 加载已有标注
-    if (image.annotations) {
-        state.annotations = [...image.annotations];
-    }
-
-    // 保存工作状态
+    invalidateStaticCache();
     saveWorkState();
 
-    // 加载图片
-    currentImage = new Image();
-    currentImage.onload = () => {
-        // 首次加载时适应视图
+    const image = state.images[index];
+    const nextImage = new Image();
+    nextImage.onload = () => {
+        currentImage = nextImage;
         fitToView();
         updateAnnotationList();
         updateImageList();
         document.getElementById('currentImageInfo').textContent =
             `${index + 1} / ${state.images.length} - ${image.filename}`;
     };
-    currentImage.src = `/api/image/serve?path=${encodeURIComponent(image.path)}`;
+    nextImage.onerror = () => {
+        showToast('图片加载失败', image.path, 'danger');
+    };
+    nextImage.src = `/api/image/serve?path=${encodeURIComponent(image.path)}`;
+    return true;
 }
 
 function prevImage() {
@@ -1881,27 +1906,38 @@ function nextImage() {
 
 function updateAnnotationList() {
     const list = document.getElementById('annotationList');
-
     if (state.annotations.length === 0) {
         list.innerHTML = '<div class="text-muted small p-2">暂无标注</div>';
         return;
     }
-
-    list.innerHTML = state.annotations.map((ann, idx) => `
-        <div class="annotation-item ${state.selectedAnnotation === ann.id ? 'selected' : ''}"
-             onclick="selectAnnotation('${ann.id}')">
-            <div class="color-indicator" style="background-color: ${colors[idx % colors.length]}"></div>
-            <div class="info">
-                <div class="label">${ann.class_name || ann.label || 'obj'}${idx + 1}</div>
-                <div class="score">置信度: ${(ann.score || 0).toFixed(2)}</div>
+    list.innerHTML = state.annotations.map((annotation, index) => {
+        const id = escapeHtml(annotation.id);
+        const label = escapeHtml(annotation.class_name || annotation.label || 'obj');
+        const score = Number(annotation.score) || 0;
+        return `
+            <div class="annotation-item ${state.selectedAnnotation === annotation.id ? 'selected' : ''}"
+                 data-annotation-id="${id}">
+                <div class="color-indicator" style="background-color: ${colors[index % colors.length]}"></div>
+                <div class="info">
+                    <div class="label">${label}${index + 1}</div>
+                    <div class="score">置信度: ${score.toFixed(2)}</div>
+                </div>
+                <div class="actions">
+                    <button class="btn btn-outline-danger btn-sm delete-annotation">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </div>
             </div>
-            <div class="actions">
-                <button class="btn btn-outline-danger btn-sm" onclick="deleteAnnotation('${ann.id}', event)">
-                    <i class="bi bi-trash"></i>
-                </button>
-            </div>
-        </div>
-    `).join('');
+        `;
+    }).join('');
+    list.querySelectorAll('.annotation-item').forEach(item => {
+        const id = item.dataset.annotationId;
+        item.addEventListener('click', () => selectAnnotation(id));
+        item.querySelector('.delete-annotation').addEventListener('click', event => {
+            event.stopPropagation();
+            deleteAnnotation(id);
+        });
+    });
 }
 
 function selectAnnotation(id) {
@@ -1928,13 +1964,19 @@ function selectAnnotationAt(x, y) {
 
 async function deleteAnnotation(id, event) {
     if (event) event.stopPropagation();
-    state.annotations = state.annotations.filter(a => a.id !== id);
+    const previous = structuredClone(state.annotations);
+    state.annotations = state.annotations.filter(annotation => annotation.id !== id);
     state.selectedAnnotation = null;
-    invalidateStaticCache();  // 标注变化，更新缓存
+    invalidateStaticCache();
     updateAnnotationList();
     redraw();
-    // 自动保存
-    await saveAnnotations(false);
+    if (!(await saveAnnotations(false))) {
+        state.annotations = previous;
+        invalidateStaticCache();
+        updateAnnotationList();
+        redraw();
+        showToast('删除已撤销', '保存失败，原标注已恢复', 'warning');
+    }
 }
 
 function deleteSelectedAnnotation() {
@@ -1944,10 +1986,11 @@ function deleteSelectedAnnotation() {
 }
 
 async function saveAnnotations(showMessage = true) {
-    if (!state.projectId || state.currentIndex < 0) return;
-
+    if (!state.projectId || state.currentIndex < 0 || !state.images[state.currentIndex]) {
+        return false;
+    }
     try {
-        const response = await fetch('/api/annotation/save', {
+        await apiRequest('/api/annotation/save', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1956,18 +1999,15 @@ async function saveAnnotations(showMessage = true) {
                 annotations: state.annotations
             })
         });
-
-        const data = await response.json();
-        if (data.success) {
-            state.images[state.currentIndex].annotations = [...state.annotations];
-            state.images[state.currentIndex].annotated = state.annotations.length > 0;
-            updateImageList();
-            if (showMessage) {
-                showToast('成功', '标注已保存');
-            }
-        }
+        state.images[state.currentIndex].annotations =
+            structuredClone(state.annotations);
+        state.images[state.currentIndex].annotated = state.annotations.length > 0;
+        updateImageList();
+        if (showMessage) showToast('成功', '标注已安全写入磁盘');
+        return true;
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('保存失败', error.message, 'danger');
+        return false;
     }
 }
 
@@ -1975,26 +2015,30 @@ async function saveAnnotations(showMessage = true) {
 
 function updateClassList() {
     const list = document.getElementById('classList');
-
     if (state.classes.length === 0) {
         list.innerHTML = '<div class="text-muted small">暂无类别，请先添加</div>';
         state.currentClass = null;
         return;
     }
-
-    // 如果当前没有选中类名，或选中的类名已被删除，自动选中第一个
     if (!state.currentClass || !state.classes.includes(state.currentClass)) {
         state.currentClass = state.classes[0];
     }
-
-    list.innerHTML = state.classes.map((cls, idx) => `
-        <div class="class-item ${state.currentClass === cls ? 'selected' : ''}"
-             onclick="selectClass('${cls}')" title="点击选择此类别">
-            <div class="color-dot" style="background-color: ${colors[idx % colors.length]}"></div>
-            <span class="name">${cls}</span>
-            <i class="bi bi-x delete-btn" onclick="event.stopPropagation(); removeClass('${cls}')"></i>
+    list.innerHTML = state.classes.map((className, index) => `
+        <div class="class-item ${state.currentClass === className ? 'selected' : ''}"
+             data-class-name="${escapeHtml(className)}" title="点击选择此类别">
+            <div class="color-dot" style="background-color: ${colors[index % colors.length]}"></div>
+            <span class="name">${escapeHtml(className)}</span>
+            <i class="bi bi-x delete-btn" title="删除类别"></i>
         </div>
     `).join('');
+    list.querySelectorAll('.class-item').forEach(item => {
+        const className = item.dataset.className;
+        item.addEventListener('click', () => selectClass(className));
+        item.querySelector('.delete-btn').addEventListener('click', event => {
+            event.stopPropagation();
+            removeClass(className);
+        });
+    });
 }
 
 // 选择当前类名
@@ -2007,38 +2051,55 @@ function selectClass(className) {
 async function addClass() {
     const input = document.getElementById('newClassName');
     const name = input.value.trim();
-
     if (!name || state.classes.includes(name)) return;
 
-    state.classes.push(name);
-    updateClassList();
-    input.value = '';
-
-    if (state.projectId) {
-        await fetch('/api/classes/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                project_id: state.projectId,
-                classes: state.classes
-            })
-        });
+    const nextClasses = [...state.classes, name];
+    try {
+        if (state.projectId) {
+            await apiRequest('/api/classes/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    project_id: state.projectId,
+                    classes: nextClasses
+                })
+            });
+        }
+        state.classes = nextClasses;
+        state.currentClass = name;
+        updateClassList();
+        input.value = '';
+    } catch (error) {
+        showToast('添加类别失败', error.message, 'danger');
     }
 }
 
 async function removeClass(name) {
-    state.classes = state.classes.filter(c => c !== name);
-    updateClassList();
-
-    if (state.projectId) {
-        await fetch('/api/classes/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                project_id: state.projectId,
-                classes: state.classes
-            })
-        });
+    const used = state.annotations.some(
+        annotation => (annotation.class_name || annotation.label) === name
+    );
+    if (used && !confirm(`当前图片包含类别 \"${name}\" 的标注，仍要从类别列表删除吗？`)) {
+        return;
+    }
+    const previousClasses = state.classes;
+    const nextClasses = state.classes.filter(className => className !== name);
+    try {
+        if (state.projectId) {
+            await apiRequest('/api/classes/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    project_id: state.projectId,
+                    classes: nextClasses
+                })
+            });
+        }
+        state.classes = nextClasses;
+        updateClassList();
+    } catch (error) {
+        state.classes = previousClasses;
+        updateClassList();
+        showToast('删除类别失败', error.message, 'danger');
     }
 }
 
@@ -2062,16 +2123,14 @@ async function exportDataset() {
     const outputDir = document.getElementById('exportOutputDir').value.trim();
     const smoothLevel = document.getElementById('exportSmoothLevel').value;
     const exportType = document.getElementById('exportType').value;
-
     if (!outputDir) {
-        showToast('提示', '请输入输出目录');
+        showToast('提示', '请选择输出目录', 'warning');
         return;
     }
 
     showLoading('正在导出...');
-
     try {
-        const response = await fetch(`/api/export/${format}`, {
+        const data = await apiRequest(`/api/export/${format}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2081,22 +2140,25 @@ async function exportDataset() {
                 export_type: exportType
             })
         });
-
-        const data = await response.json();
-        if (data.success) {
-            const result = data.result;
-            const smoothNames = {none: '无', low: '低', medium: '中等', high: '高', ultra: '超高'};
-            showToast('成功',
-                `导出完成!\nTrain: ${result.train}, Val: ${result.val}, Test: ${result.test}\n` +
-                `总标注: ${result.total_annotations}\n平滑级别: ${smoothNames[smoothLevel]}`
-            );
-            bootstrap.Modal.getInstance(document.getElementById('exportModal')).hide();
-        }
+        const result = data.result;
+        const smoothNames = {
+            none: '无',
+            low: '低',
+            medium: '中等',
+            high: '高',
+            ultra: '超高'
+        };
+        showToast(
+            '导出完成',
+            `Train: ${result.train}, Val: ${result.val}, Test: ${result.test}\n` +
+            `总标注: ${result.total_annotations}\n平滑级别: ${smoothNames[smoothLevel]}`
+        );
+        bootstrap.Modal.getInstance(document.getElementById('exportModal'))?.hide();
     } catch (error) {
-        showToast('错误', error.message, 'danger');
+        showToast('导出失败', error.message, 'danger');
+    } finally {
+        hideLoading();
     }
-
-    hideLoading();
 }
 
 // ==================== 导出预览 ====================
@@ -2429,7 +2491,12 @@ function showToast(title, message, type = 'success') {
     document.getElementById('toastBody').textContent = message;
 
     toast.classList.remove('bg-success', 'bg-danger', 'bg-warning');
-    if (type === 'danger') toast.classList.add('bg-danger');
+    const background = {
+        success: 'bg-success',
+        danger: 'bg-danger',
+        warning: 'bg-warning'
+    }[type];
+    if (background) toast.classList.add(background);
 
     new bootstrap.Toast(toast).show();
 }

@@ -28,6 +28,10 @@
                     <div class="app-brand">
                          <img src="/static/sam_an.png" alt="Logo" style="height: 32px; margin-right: 10px; vertical-align: middle;">SAM3 AN
                     </div>
+                    <div class="runtime-status" id="runtimeStatus" title="正在检测运行环境">
+                        <span class="runtime-dot"></span>
+                        <span>检测运行环境…</span>
+                    </div>
                     
                     <div class="project-info-card">
                         <div class="project-name" id="projectName" title="当前项目">未选择项目</div>
@@ -296,13 +300,26 @@
                             </div>
                             <div class="mb-3">
                                 <label class="form-label">图片目录</label>
-                                <input type="text" class="form-control" id="newProjectImageDir"
-                                       placeholder="C:\path\to\images">
+                                <div class="input-group">
+                                    <input type="text" class="form-control" id="newProjectImageDir"
+                                           placeholder="/Users/用户名/Pictures/dataset">
+                                    <button type="button" class="btn btn-outline-secondary"
+                                            onclick="chooseDirectory('newProjectImageDir', 'image')">
+                                        <i class="bi bi-folder2-open"></i> 选择
+                                    </button>
+                                </div>
+                                <div class="form-text">支持 <code>~</code>；macOS 会打开 Finder 目录选择器</div>
                             </div>
                             <div class="mb-3">
                                 <label class="form-label">输出目录</label>
-                                <input type="text" class="form-control" id="newProjectOutputDir"
-                                       placeholder="C:\path\to\output">
+                                <div class="input-group">
+                                    <input type="text" class="form-control" id="newProjectOutputDir"
+                                           placeholder="/Users/用户名/Documents/SAM3-exports">
+                                    <button type="button" class="btn btn-outline-secondary"
+                                            onclick="chooseDirectory('newProjectOutputDir', 'output')">
+                                        <i class="bi bi-folder2-open"></i> 选择
+                                    </button>
+                                </div>
                             </div>
                             <div class="mb-3">
                                 <label class="form-label">初始类别（逗号分隔）</label>
@@ -352,8 +369,14 @@
                             </div>
                             <div class="mb-3">
                                 <label class="form-label">输出目录</label>
-                                <input type="text" class="form-control" id="exportOutputDir"
-                                       placeholder="C:\path\to\export">
+                                <div class="input-group">
+                                    <input type="text" class="form-control" id="exportOutputDir"
+                                           placeholder="/Users/用户名/Documents/SAM3-exports">
+                                    <button type="button" class="btn btn-outline-secondary"
+                                            onclick="chooseDirectory('exportOutputDir', 'output')">
+                                        <i class="bi bi-folder2-open"></i> 选择
+                                    </button>
+                                </div>
                             </div>
                             <input type="hidden" id="exportSmoothLevel" value="medium">
                             <div class="alert alert-info small">
