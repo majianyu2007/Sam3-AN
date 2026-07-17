@@ -71,14 +71,10 @@ class SAM3Service:
         print(f"[INFO] 使用设备: {self.device}")
 
         bpe_path = sam3_src / "assets" / "bpe_simple_vocab_16e6.txt.gz"
-        # 工厂仅在 device=="cuda" 时迁移模型；MPS 需传入 cpu 再手动迁移，避免
-        # _setup_device_and_mode 忽略非 cuda 设备导致模型留 CPU
         self.image_model = build_sam3_image_model(
             bpe_path=str(bpe_path),
-            device="cpu" if self.device == "mps" else self.device,
+            device=self.device,
         )
-        if self.device == "mps":
-            self.image_model = self.image_model.to(self.device)
         self.image_processor = Sam3Processor(self.image_model, device=self.device)
 
         print("SAM3图像模型加载完成")

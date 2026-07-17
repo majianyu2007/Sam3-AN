@@ -60,36 +60,58 @@
 
 ### 环境要求
 
-- Python 3.10+
-- CUDA 12.6 (推荐，CPU 也可运行但较慢)
-- 8GB+ GPU 显存 (推荐)
+- Python 3.11（项目通过 `.python-version` 固定；`numpy==1.26` 不支持 Python 3.13+）
+- macOS Apple Silicon：使用 PyTorch MPS，已在 Apple M5 上验证文本/点/框分割
+- Windows / Linux：推荐 CUDA 12.6 与 8GB+ 显存；CPU 可运行但较慢
+- 权重文件 `sam3.pt` 约 3.45GB
 
 ### 安装步骤
 
 ```bash
-（建议先创建虚拟环境）
 # 1. 进入项目目录
-cd Sam3 an
+cd Sam3-AN
 
-# 2. 安装 PyTorch 
-pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+# 2. 安装 uv（macOS）
+brew install uv
 
-# 3. 安装所有依赖
-pip install -r requirements.txt
-
-# 4.下载sam3.pt 模型本体，放置在工作目录下
-https://www.modelscope.cn/models/facebook/sam3
+# 3. 创建 Python 3.11 虚拟环境并安装锁定依赖
+uv sync
 ```
 
-> **注意**: SAM3 核心代码已包含在 `SAM_src/` 目录中，无需额外安装。
+> SAM3 核心代码已包含在 `SAM_src/`，无需另外安装。macOS 会安装 `eva-decord`
+> （仍使用 `import decord`）；Windows/Linux 使用 `decord`。
+
+### 下载模型权重
+
+优先从官方 ModelScope 下载 `sam3.pt` 并放到项目根目录：
+https://www.modelscope.cn/models/facebook/sam3
+
+也可使用本项目 macOS 验证所用的公开 Hugging Face 镜像（官方
+`facebook/sam3` 仓库需要登录授权）：
+
+```bash
+curl --fail --location --retry 20 --continue-at - \
+  --output sam3.pt \
+  https://huggingface.co/1038lab/sam3/resolve/main/sam3.pt
+
+# 校验：文件大小 3,450,062,241 bytes
+shasum -a 256 sam3.pt
+# 9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e
+```
+
+权重由 `.gitignore` 排除，不要提交到 Git。
 
 ### 启动服务
 
 ```bash
-python app.py
+uv run python app.py
+
+# 如果 MPS 出现兼容问题，可强制使用 CPU
+SAM3_DEVICE=cpu uv run python app.py
 ```
 
-启动后会自动打开浏览器访问 http://localhost:5000
+启动后自动打开浏览器。默认使用 `http://localhost:5000`；如果 macOS AirPlay
+Receiver 占用 5000，会自动依次回退到 5001/5055/8000/8080。
 
 ## 📖 使用指南
 
@@ -237,6 +259,15 @@ A: SAM3 需要约 6-8GB 显存。可尝试：
 - 关闭其他 GPU 程序
 - 使用较小的图片
 - 使用 CPU 模式（较慢）
+
+### Q: macOS 提示 MPS/CUDA 错误？
+A: 默认设备优先级为 CUDA → MPS → CPU。Apple Silicon 应自动选择 MPS；可运行
+`SAM3_DEVICE=cpu uv run python app.py` 强制回退 CPU。不要在 macOS 安装
+`triton-windows`，项目已通过平台标记自动跳过。
+
+### Q: macOS 的 5000 端口被占用？
+A: AirPlay Receiver 经常占用 5000。程序会自动选择 5001/5055/8000/8080，
+无需关闭 AirPlay；终端会打印实际访问地址。
 
 ### Q: 分割结果不准确？
 A: 尝试以下方法：
