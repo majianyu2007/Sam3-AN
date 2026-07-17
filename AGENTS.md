@@ -95,8 +95,10 @@ only in its own dev extras — not wired for the app.
   `jsonify({'success': False, 'error': str(e)})` inside a `try/except`. Match this for any new endpoint.
 - **Lazy service loading**: services needing the GPU model go through `get_sam3_service()` (singleton, first-call init).
   Do not import-time initialize SAM3 — it's ~3.2 GB and slow.
-- **Persistence via orjson + `threading.RLock`**: `AnnotationManager` writes immediately after mutations,
-  using fsynced temp files + `os.replace`, valid `.bak` recovery, a delayed 60s autosave, and graceful `shutdown()`.
+- **Persistence via orjson + `threading.RLock`**: `AnnotationManager` keeps `data/projects.json` as a
+  schema-v2 metadata-only registry; large image/annotation arrays live in `data/<id>/annotations.json`.
+  Annotation mutations write only the project detail file, using fsynced temp files + `os.replace`, valid
+  `.bak` recovery, a delayed 60s autosave, and graceful `shutdown()`.
 - **Routing layout**: `app.py` is organized by `# ==================== <Section> API ====================` comment banners
   (Project / Image / SAM3 segment / Annotation / Classes / Export / Export preview / Video / AI translate / App exit).
   Add new routes under the matching banner.
@@ -105,7 +107,10 @@ only in its own dev extras — not wired for the app.
 - **Naming**: snake_case throughout Python; Flask routes use `/api/<resource>/<action>` (e.g. `/api/project/<id>/update`).
 - **i18n**: docstrings and UI strings are **Chinese**; user-facing error messages are Chinese. Preserve when editing.
 - **Frontend**: vanilla JS in `static/js/annotation.js`, no framework/bundler. Extend the `state` object and use
-  `apiRequest()` for `/api/*` calls so HTTP failures and `{success:false}` envelopes reach the user. Video page uses its own inline JS in `templates/video.html`.
+  `apiRequest()` for normal `/api/*` calls. Annotation saves are serialized and revision-checked; mutations must
+  call `recordAnnotationMutation()` to update bounded undo history, dirty state, and autosave. Canvas bitmaps stay
+  at source resolution while CSS applies zoom. The image sidebar is window-rendered, so never restore full-list
+  DOM rebuilding. Video page uses its own inline JS in `templates/video.html`.
 - **SAM3 source path hack**: `app.py` does `sys.path.insert(0, "SAM_src")` before importing SAM3 symbols. Any module needing SAM3 must rely on this side effect (or re-insert) — do not `pip install` the vendored package.
 - **Device selection (cross-platform)**: `services/sam3_service.py:_select_device()` picks CUDA > MPS (macOS Apple Silicon) > CPU at image-model init. `SAM_src/sam3/model_builder.py:_setup_device_and_mode()` uses `model.to(device)` for all devices. Force via `SAM3_DEVICE=cuda|mps|cpu` (unavailable requested devices fall back to CPU). Always construct `Sam3Processor(..., device=device)` explicitly — its upstream default is `"cuda"`.
 - **Vendored macOS patches — preserve on SAM3 updates**: `model/edt.py` guards unavailable macOS `triton`; `model_builder.py` uses device-agnostic `.to(device)`; `model/position_encoding.py` and `model/decoder.py` precompute caches on CPU then migrate once to the input device; `sam/transformer.py` invalidates RoPE cache on device mismatch; `model/geometry_encoders.py` avoids CUDA-only pinned-memory transfer semantics; `model/sam3_video_inference.py` disables CUDA autocast decorators when CUDA is unavailable. These are required for real MPS inference or clean macOS startup, not cosmetic changes.
@@ -134,8 +139,9 @@ only in its own dev extras — not wired for the app.
 
 ## Testing & QA
 
-- **Project stability suite**: `tests/test_stability.py` uses stdlib `unittest` for atomic persistence/recovery,
-  route envelopes/path validation, singleton concurrency, and inference-error propagation. Run:
+- **Project stability suite**: `tests/test_stability.py` uses stdlib `unittest` for compact registry/detail
+  persistence, atomic recovery, lightweight project-list contracts, route envelopes/path validation, singleton
+  concurrency, and inference-error propagation. Run:
   `uv run python -m unittest discover -s tests -p 'test_stability.py' -v`.
 - **Vendor tests**: `SAM_src/sam3/perflib/tests/tests.py` contains the upstream `TestMasksToBoxes`; a standalone
   `test_reindex_function()` exists in `SAM_src/sam3/eval/coco_reindex.py`.

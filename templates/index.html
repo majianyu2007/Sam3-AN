@@ -145,10 +145,12 @@
                     <div class="toolbar-separator"></div>
 
                     <!-- 分割操作按钮 -->
-                    <button class="btn btn-segment" onclick="segmentManual()" title="执行分割">
+                    <button class="btn btn-segment" id="segmentPromptButton"
+                            onclick="segmentManual()" title="执行分割">
                         <i class="bi bi-cpu"></i> 分割
                     </button>
-                    <button class="btn btn-tool" onclick="clearTempPrompts()" title="清除临时标记">
+                    <button class="btn btn-tool" id="clearPromptButton"
+                            onclick="clearTempPrompts()" title="清除临时标记">
                         <i class="bi bi-x-lg"></i>
                     </button>
 
@@ -182,19 +184,35 @@
                 </div>
 
                 <div class="canvas-footer">
-                    <button class="btn btn-secondary btn-sm" onclick="prevImage()">
+                    <button class="btn btn-secondary btn-sm" id="prevImageButton"
+                            onclick="prevImage()" aria-label="上一张图片" title="上一张图片（←）">
                         <i class="bi bi-chevron-left"></i>
                     </button>
                     <span id="currentImageInfo" class="image-info">-</span>
-                    <button class="btn btn-secondary btn-sm" onclick="nextImage()">
+                    <button class="btn btn-secondary btn-sm" id="nextImageButton"
+                            onclick="nextImage()" aria-label="下一张图片" title="下一张图片（→）">
                         <i class="bi bi-chevron-right"></i>
                     </button>
-                    
+                    <span id="toolHint" class="tool-hint">点击添加正样本点，按分割执行</span>
+
                     <div class="action-buttons">
-                        <button class="btn btn-danger btn-sm" onclick="clearCurrentAnnotations()" title="清除当前图片标注">
+                        <span id="saveStatus" class="save-status saved" aria-live="polite">已保存</span>
+                        <button class="btn btn-secondary btn-sm" id="undoButton"
+                                onclick="undoAnnotationChange()" disabled
+                                aria-label="撤销" title="撤销（⌘Z / Ctrl+Z）">
+                            <i class="bi bi-arrow-counterclockwise"></i>
+                        </button>
+                        <button class="btn btn-secondary btn-sm" id="redoButton"
+                                onclick="redoAnnotationChange()" disabled
+                                aria-label="重做" title="重做（⌘⇧Z / Ctrl+Shift+Z）">
+                            <i class="bi bi-arrow-clockwise"></i>
+                        </button>
+                        <button class="btn btn-danger btn-sm" onclick="clearCurrentAnnotations()"
+                                title="清除当前图片标注">
                             <i class="bi bi-trash"></i>
                         </button>
-                        <button class="btn btn-primary btn-sm" onclick="saveAnnotations()">
+                        <button class="btn btn-primary btn-sm" id="saveButton"
+                                onclick="saveAnnotations()">
                             <i class="bi bi-check-lg"></i> 保存
                         </button>
                     </div>
@@ -485,6 +503,27 @@
         </div>
     </div>
 
+    <!-- 非阻塞确认对话框 -->
+    <div class="modal fade" id="confirmModal" tabindex="-1"
+         aria-labelledby="confirmModalTitle" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="confirmModalTitle">确认操作</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"
+                            aria-label="关闭"></button>
+                </div>
+                <div class="modal-body confirm-message" id="confirmModalMessage"></div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary"
+                            onclick="resolveConfirmation(false)">取消</button>
+                    <button type="button" class="btn btn-danger" id="confirmModalButton"
+                            onclick="resolveConfirmation(true)">确认</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast 通知 -->
     <div class="toast-container position-fixed top-0 start-0 p-3" style="z-index: 9999; margin-top: 10px; margin-left: 290px;">
         <div id="toast" class="toast cyber-toast" role="alert">
@@ -522,6 +561,10 @@
                 <div class="progress-bar" id="loadingProgress" style="width: 0%"></div>
             </div>
             <div class="progress-text" id="loadingProgressText">0%</div>
+            <button type="button" class="btn btn-outline-warning btn-sm mt-3"
+                    id="cancelBatchButton" onclick="cancelBatch()" hidden>
+                完成当前图片后停止
+            </button>
         </div>
     </div>
 

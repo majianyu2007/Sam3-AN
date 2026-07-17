@@ -25,7 +25,11 @@ const state = {
     selectedAnnotation: null,
     tempPoints: [],
     tempBoxes: [],  // 临时框数组，每个框包含 {x1, y1, x2, y2, label}
-    tempPolygon: [] // 手动绘制的多边形顶点
+    tempPolygon: [], // 手动绘制的多边形顶点
+    dirty: false,
+    revision: 0,
+    history: [],
+    historyIndex: -1
 };
 
 // Canvas相关
@@ -38,6 +42,107 @@ let staticCtx = null;
 let staticCacheDirty = true;  // 静态缓存是否需要更新
 let rafId = null;  // requestAnimationFrame ID
 let pendingDraw = null;  // 待绘制的动态内容
+const IMAGE_ROW_HEIGHT = 40;
+let imageFilterQuery = '';
+let filteredImageIndices = [];
+let renderedImages = null;
+let imageListRafId = null;
+let imageSearchTimer = null;
+let imageLoadToken = 0;
+const MAX_ANNOTATION_HISTORY = 30;
+let annotationAutosaveTimer = null;
+let saveQueue = Promise.resolve();
+let lastQueuedSave = null;
+let batchCancelRequested = false;
+
+function cancelBatch() {
+    batchCancelRequested = true;
+    const button = document.getElementById('cancelBatchButton');
+    button.disabled = true;
+    button.textContent = '正在完成当前图片…';
+}
+
+function updateSaveIndicator(status, message) {
+    const indicator = document.getElementById('saveStatus');
+    const button = document.getElementById('saveButton');
+    if (!indicator || !button) return;
+    const labels = {
+        saved: '已保存',
+        dirty: '等待自动保存',
+        saving: '正在保存…',
+        error: '保存失败'
+    };
+    indicator.className = `save-status ${status}`;
+    indicator.textContent = message || labels[status] || '';
+    button.disabled = status === 'saving';
+}
+
+function renderAnnotationState() {
+    if (state.images[state.currentIndex]) {
+        state.images[state.currentIndex].annotated = state.annotations.length > 0;
+    }
+    state.selectedAnnotation = null;
+    invalidateStaticCache();
+    updateAnnotationList();
+    updateImageList();
+    redraw();
+}
+
+function resetAnnotationHistory() {
+    state.revision++;
+    state.history = [structuredClone(state.annotations)];
+    state.historyIndex = 0;
+    state.dirty = false;
+    updateSaveIndicator('saved');
+    updateHistoryButtons();
+}
+
+function recordAnnotationMutation({ autosave = true } = {}) {
+    state.revision++;
+    state.history.splice(state.historyIndex + 1);
+    state.history.push(structuredClone(state.annotations));
+    if (state.history.length > MAX_ANNOTATION_HISTORY) {
+        state.history.shift();
+    }
+    state.historyIndex = state.history.length - 1;
+    state.dirty = true;
+    renderAnnotationState();
+    updateSaveIndicator('dirty');
+    updateHistoryButtons();
+    if (autosave) scheduleAnnotationAutosave();
+}
+
+function updateHistoryButtons() {
+    const undoButton = document.getElementById('undoButton');
+    const redoButton = document.getElementById('redoButton');
+    if (undoButton) undoButton.disabled = state.historyIndex <= 0;
+    if (redoButton) redoButton.disabled =
+        state.historyIndex < 0 || state.historyIndex >= state.history.length - 1;
+}
+
+function applyHistory(index) {
+    if (index < 0 || index >= state.history.length) return;
+    state.historyIndex = index;
+    state.annotations = structuredClone(state.history[index]);
+    state.revision++;
+    state.dirty = true;
+    renderAnnotationState();
+    updateSaveIndicator('dirty');
+    updateHistoryButtons();
+    scheduleAnnotationAutosave();
+}
+
+function undoAnnotationChange() {
+    if (state.tempPolygon.length > 0) {
+        undoPolygonPoint();
+        return;
+    }
+    applyHistory(state.historyIndex - 1);
+}
+
+function redoAnnotationChange() {
+    applyHistory(state.historyIndex + 1);
+}
 
 // 颜色映射
 const colors = [
@@ -57,6 +162,56 @@ async function apiRequest(url, options = {}) {
         throw new Error(data.error || `请求失败（HTTP ${response.status}）`);
     }
     return data;
+}
+
+let confirmationResolver = null;
+
+function resolveConfirmation(value) {
+    const resolver = confirmationResolver;
+    confirmationResolver = null;
+    if (resolver) resolver(value);
+
+    const modalElement = document.getElementById('confirmModal');
+    const modal = bootstrap.Modal.getOrCreateInstance(modalElement);
+    if (modal._isTransitioning) {
+        modalElement.addEventListener('shown.bs.modal', () => modal.hide(), {
+            once: true
+        });
+    } else {
+        modal.hide();
+    }
+}
+
+function confirmAction({
+    title = '确认操作',
+    message,
+    confirmText = '确认',
+    danger = false
+}) {
+    const modalElement = document.getElementById('confirmModal');
+    if (!modalElement.dataset.initialized) {
+        modalElement.dataset.initialized = 'true';
+        modalElement.addEventListener('hidden.bs.modal', () => {
+            if (confirmationResolver) {
+                const resolver = confirmationResolver;
+                confirmationResolver = null;
+                resolver(false);
+            }
+        });
+    }
+    if (confirmationResolver) {
+        confirmationResolver(false);
+        confirmationResolver = null;
+    }
+    document.getElementById('confirmModalTitle').textContent = title;
+    document.getElementById('confirmModalMessage').textContent = message;
+    const confirmButton = document.getElementById('confirmModalButton');
+    confirmButton.textContent = confirmText;
+    confirmButton.className = `btn ${danger ? 'btn-danger' : 'btn-primary'}`;
+    bootstrap.Modal.getOrCreateInstance(modalElement).show();
+    return new Promise(resolve => {
+        confirmationResolver = resolve;
+    });
 }
 
 function escapeHtml(value) {
@@ -124,6 +279,28 @@ document.addEventListener('DOMContentLoaded', async () => {
     await restoreWorkState();
 });
 
+window.addEventListener('beforeunload', event => {
+    if (!state.dirty || !state.projectId || !state.images[state.currentIndex]) return;
+    fetch('/api/annotation/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            project_id: state.projectId,
+            image_index: state.currentIndex,
+            annotations: state.annotations
+        }),
+        keepalive: true
+    }).catch(() => {});
+    event.preventDefault();
+    event.returnValue = '';
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && state.dirty) {
+        saveAnnotations(false);
+    }
+});
+
 // 保存工作状态到localStorage
 function saveWorkState() {
     if (state.projectId) {
@@ -167,6 +344,7 @@ async function restoreWorkState() {
 // 重新扫描项目图片文件夹
 async function rescanProjectImages({ notify = false } = {}) {
     if (!state.projectId) return false;
+    if (state.dirty && !(await saveAnnotations(false))) return false;
     try {
         const data = await apiRequest(`/api/project/${state.projectId}`);
         if (!data.project.image_dir) return true;
@@ -197,24 +375,18 @@ async function clearCurrentAnnotations() {
         showToast('提示', '当前没有标注');
         return;
     }
-    if (!confirm(`确定要清除当前图片的 ${state.annotations.length} 个标注吗？`)) {
-        return;
-    }
-
-    const previous = state.annotations;
+    if (!(await confirmAction({
+        title: '清除当前标注',
+        message: `确定要清除当前图片的 ${state.annotations.length} 个标注吗？`,
+        confirmText: '清除',
+        danger: true
+    }))) return;
     state.annotations = [];
-    state.selectedAnnotation = null;
-    invalidateStaticCache();
-    updateAnnotationList();
-    redraw();
+    recordAnnotationMutation({ autosave: false });
     if (await saveAnnotations(false)) {
         showToast('成功', '已清除并写入磁盘');
     } else {
-        state.annotations = previous;
-        invalidateStaticCache();
-        updateAnnotationList();
-        redraw();
-        showToast('清除已撤销', '保存失败，原标注已恢复', 'warning');
+        showToast('清除尚未保存', '修改仍保留在页面，可撤销或重试保存', 'warning');
     }
 }
 
@@ -256,6 +428,7 @@ function initToolbarState() {
     // 设置默认为正样本
     const positiveBtn = document.getElementById('labelPositive');
     if (positiveBtn) positiveBtn.classList.add('active');
+    updateToolGuidance();
 }
 
 function initEventListeners() {
@@ -265,9 +438,23 @@ function initEventListeners() {
         document.getElementById('confidenceValue').textContent = state.confidence.toFixed(2);
     });
 
-    // 图片搜索
-    document.getElementById('imageSearch').addEventListener('input', (e) => {
-        filterImages(e.target.value);
+    const imageSearch = document.getElementById('imageSearch');
+    imageSearch.addEventListener('input', event => {
+        clearTimeout(imageSearchTimer);
+        imageSearchTimer = setTimeout(() => filterImages(event.target.value), 120);
+    });
+
+    const imageList = document.getElementById('imageList');
+    imageList.addEventListener('scroll', () => {
+        if (imageListRafId) return;
+        imageListRafId = requestAnimationFrame(() => {
+            renderImageListWindow();
+            imageListRafId = null;
+        });
+    });
+    imageList.addEventListener('click', event => {
+        const item = event.target.closest('.image-item');
+        if (item) loadImage(Number(item.dataset.imageIndex));
     });
 
     // 文本提示回车
@@ -280,52 +467,62 @@ function initEventListeners() {
 
 function setTool(tool) {
     state.currentTool = tool;
-    state.tempPoints = [];
-    state.tempBoxes = [];
-    state.tempPolygon = [];  // 清除临时多边形
-
-    // 移除所有工具按钮的 active 状态
-    document.querySelectorAll('.toolbar-group .btn-tool').forEach(btn => {
-        // 只处理工具按钮（不处理正负样本按钮）
-        if (btn.id && btn.id.startsWith('tool')) {
-            btn.classList.remove('active');
-        }
+    document.querySelectorAll('.toolbar-group .btn-tool').forEach(button => {
+        if (button.id?.startsWith('tool')) button.classList.remove('active');
     });
+    const toolButton = document.getElementById(
+        'tool' + tool.charAt(0).toUpperCase() + tool.slice(1)
+    );
+    toolButton?.classList.add('active');
+    updateToolGuidance();
+    updateCursor();
 
-    // 激活当前工具按钮
-    const toolBtn = document.getElementById('tool' + tool.charAt(0).toUpperCase() + tool.slice(1));
-    if (toolBtn) {
-        toolBtn.classList.add('active');
+    if (tool === 'text') {
+        const rightPanel = document.getElementById('rightPanel');
+        rightPanel.classList.remove('collapsed', 'auto-collapse');
+        document.getElementById('rightExpandBtn').style.display = 'none';
+        const prompt = document.getElementById('textPrompt');
+        prompt.scrollIntoView({ block: 'nearest' });
+        prompt.focus();
     }
-
-    // 更新光标
-    if (tool === 'edit') {
-        canvas.style.cursor = 'default';
-    } else {
-        canvas.style.cursor = 'crosshair';
-    }
-
     redraw();
+}
+
+function updateToolGuidance() {
+    const positive = state.isPositive ? '正样本' : '负样本';
+    const guidance = {
+        point: `点击添加${positive}点；可连续添加，按“分割”执行`,
+        box: `拖动绘制${positive}框；可组合多个框后执行分割`,
+        text: '在右侧输入提示词，Enter 分割当前图片',
+        polygon: '依次点击顶点；双击或 Enter 完成，Backspace 撤点',
+        edit: '点击标注以选中；Delete 删除，⌘Z / Ctrl+Z 撤销'
+    };
+    const hint = document.getElementById('toolHint');
+    if (hint) hint.textContent = guidance[state.currentTool] || '';
+    const promptTool = state.currentTool === 'point' || state.currentTool === 'box';
+    document.getElementById('labelGroup').hidden = !promptTool;
+    document.getElementById('confidenceGroup').hidden = state.currentTool !== 'text';
+    document.getElementById('segmentPromptButton').hidden = !promptTool;
+    document.getElementById('clearPromptButton').hidden =
+        !promptTool && state.currentTool !== 'polygon';
 }
 
 function setLabel(isPositive) {
     state.isPositive = isPositive;
     document.getElementById('labelPositive').classList.toggle('active', isPositive);
     document.getElementById('labelNegative').classList.toggle('active', !isPositive);
+    updateToolGuidance();
 }
 
 // ==================== Canvas事件处理 ====================
 
-// 获取鼠标在Canvas上的真实坐标
+// CSS 负责视觉缩放，Canvas 内部始终保持原图分辨率。
 function getCanvasCoords(e) {
     const rect = canvas.getBoundingClientRect();
-    // 计算Canvas的缩放比例（CSS尺寸 vs 实际尺寸）
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-    // 计算鼠标在Canvas上的实际坐标
-    const x = (e.clientX - rect.left) * scaleX / state.zoom;
-    const y = (e.clientY - rect.top) * scaleY / state.zoom;
-    return { x, y };
+    return {
+        x: (e.clientX - rect.left) * canvas.width / rect.width,
+        y: (e.clientY - rect.top) * canvas.height / rect.height
+    };
 }
 
 function onMouseDown(e) {
@@ -471,7 +668,7 @@ function onWheel(e) {
     const mouseXOnCanvas = e.clientX - canvasRect.left;
     const mouseYOnCanvas = e.clientY - canvasRect.top;
 
-    // 鼠标指向的图像坐标（原始图像上的位置）
+    // CSS 尺寸已按 zoom 缩放。
     const imgX = mouseXOnCanvas / state.zoom;
     const imgY = mouseYOnCanvas / state.zoom;
 
@@ -502,8 +699,7 @@ function onWheel(e) {
             if (pendingZoomData) {
                 const data = pendingZoomData;
                 state.zoom = data.newZoom;
-                invalidateStaticCache();  // 缩放变化，更新缓存
-                redraw();
+                applyCanvasZoom();
 
                 // 获取wrapper的padding（使用计算样式）
                 const wrapperStyle = window.getComputedStyle(data.wrapper);
@@ -653,7 +849,7 @@ function updateZoomDisplay() {
 function updateCursor() {
     if (state.spacePressed) {
         canvas.style.cursor = 'grab';
-    } else if (state.currentTool === 'edit') {
+    } else if (state.currentTool === 'edit' || state.currentTool === 'text') {
         canvas.style.cursor = 'default';
     } else {
         canvas.style.cursor = 'crosshair';
@@ -661,11 +857,9 @@ function updateCursor() {
 }
 
 function onKeyDown(e) {
-    // 如果焦点在输入框中，不处理快捷键（除了ESC）
+    // 在输入框内保留系统文本编辑快捷键；Escape 仅退出输入。
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
-        if (e.key === 'Escape') {
-            e.target.blur(); // 退出输入框
-        }
+        if (e.key === 'Escape') e.target.blur();
         return;
     }
 
@@ -713,21 +907,29 @@ function onKeyDown(e) {
         return;
     }
 
-    if (e.key === 'ArrowLeft') prevImage();
-    else if (e.key === 'ArrowRight') nextImage();
-    else if (e.key === 's' && e.ctrlKey) {
+    const key = e.key.toLowerCase();
+    const commandKey = e.ctrlKey || e.metaKey;
+    if (commandKey && key === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) redoAnnotationChange();
+        else undoAnnotationChange();
+    }
+    else if (commandKey && key === 'y') {
+        e.preventDefault();
+        redoAnnotationChange();
+    }
+    else if (commandKey && key === 's') {
         e.preventDefault();
         saveAnnotations();
     }
-    else if (e.key === 'Delete' && state.selectedAnnotation) {
-        deleteSelectedAnnotation();
-    }
-    // 工具快捷键
-    else if (e.key === 'p' || e.key === 'P') setTool('point');
-    else if (e.key === 'b' || e.key === 'B') setTool('box');
-    else if (e.key === 't' || e.key === 'T') setTool('text');
-    else if (e.key === 'e' || e.key === 'E') setTool('edit');
-    else if (e.key === 'g' || e.key === 'G') setTool('polygon');
+    else if (e.key === 'ArrowLeft') prevImage();
+    else if (e.key === 'ArrowRight') nextImage();
+    else if (e.key === 'Delete' && state.selectedAnnotation) deleteSelectedAnnotation();
+    else if (key === 'p') setTool('point');
+    else if (key === 'b') setTool('box');
+    else if (key === 't') setTool('text');
+    else if (key === 'e') setTool('edit');
+    else if (key === 'g') setTool('polygon');
 }
 
 function onKeyUp(e) {
@@ -750,87 +952,61 @@ function invalidateStaticCache() {
     staticCacheDirty = true;
 }
 
-// 更新静态缓存（图像 + 标注）
+// 更新源分辨率静态缓存（图像 + 标注）。缩放仅改变 CSS 尺寸。
 function updateStaticCache() {
     if (!currentImage) return;
 
-    const targetWidth = Math.floor(currentImage.width * state.zoom);
-    const targetHeight = Math.floor(currentImage.height * state.zoom);
-
-    // 初始化或调整离屏canvas大小
     if (!staticCanvas) {
         staticCanvas = document.createElement('canvas');
-        staticCtx = staticCanvas.getContext('2d', { alpha: false });  // 不透明canvas更快
+        staticCtx = staticCanvas.getContext('2d', { alpha: false });
+    }
+    if (
+        staticCanvas.width !== currentImage.naturalWidth ||
+        staticCanvas.height !== currentImage.naturalHeight
+    ) {
+        staticCanvas.width = currentImage.naturalWidth;
+        staticCanvas.height = currentImage.naturalHeight;
     }
 
-    if (staticCanvas.width !== targetWidth || staticCanvas.height !== targetHeight) {
-        staticCanvas.width = targetWidth;
-        staticCanvas.height = targetHeight;
-    }
-
-    // 优化图像渲染质量设置
-    staticCtx.imageSmoothingEnabled = state.zoom < 1;  // 缩小时平滑，放大时锐利
+    staticCtx.imageSmoothingEnabled = true;
     staticCtx.imageSmoothingQuality = 'medium';
-
-    // 绘制静态内容到离屏canvas
     staticCtx.clearRect(0, 0, staticCanvas.width, staticCanvas.height);
-    staticCtx.save();
-    staticCtx.scale(state.zoom, state.zoom);
     staticCtx.drawImage(currentImage, 0, 0);
 
-    // 绘制标注
     const originalCtx = ctx;
-    ctx = staticCtx;  // 临时切换ctx
-    state.annotations.forEach((ann, idx) => {
-        drawAnnotation(ann, idx);
+    ctx = staticCtx;
+    state.annotations.forEach((annotation, index) => {
+        drawAnnotation(annotation, index);
     });
-    ctx = originalCtx;  // 恢复ctx
-
-    staticCtx.restore();
+    ctx = originalCtx;
     staticCacheDirty = false;
 }
 
 function redraw() {
     if (!currentImage) return;
 
-    const targetWidth = Math.floor(currentImage.width * state.zoom);
-    const targetHeight = Math.floor(currentImage.height * state.zoom);
-
-    // 调整主canvas大小
-    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
-        canvas.width = targetWidth;
-        canvas.height = targetHeight;
+    if (
+        canvas.width !== currentImage.naturalWidth ||
+        canvas.height !== currentImage.naturalHeight
+    ) {
+        canvas.width = currentImage.naturalWidth;
+        canvas.height = currentImage.naturalHeight;
         staticCacheDirty = true;
     }
-
-    // 更新静态缓存（如果需要）
     if (staticCacheDirty) {
         updateStaticCache();
     }
 
-    // 从缓存绘制静态内容
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (staticCanvas) {
         ctx.drawImage(staticCanvas, 0, 0);
     }
-
-    // 绘制动态内容（临时点、框、多边形）
-    ctx.save();
-    ctx.scale(state.zoom, state.zoom);
-
-    // 绘制临时点
-    state.tempPoints.forEach(p => {
-        drawPoint(p.x, p.y, p.label);
+    state.tempPoints.forEach(point => {
+        drawPoint(point.x, point.y, point.label);
     });
-
-    // 绘制临时多边形
     if (state.tempPolygon.length > 0) {
         drawTempPolygon();
     }
-
-    ctx.restore();
-
-    // 绘制保存的临时框（在 restore 后绘制）
     state.tempBoxes.forEach(box => {
         drawTempBox(box.x1, box.y1, box.x2, box.y2, box.label);
     });
@@ -850,19 +1026,12 @@ function quickRedraw(dynamicBox) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(staticCanvas, 0, 0);
 
-    // 绘制动态内容
-    ctx.save();
-    ctx.scale(state.zoom, state.zoom);
-
-    state.tempPoints.forEach(p => {
-        drawPoint(p.x, p.y, p.label);
+    state.tempPoints.forEach(point => {
+        drawPoint(point.x, point.y, point.label);
     });
-
     if (state.tempPolygon.length > 0) {
         drawTempPolygon();
     }
-
-    ctx.restore();
 
     // 绘制已保存的临时框
     state.tempBoxes.forEach(box => {
@@ -930,17 +1099,12 @@ function drawPoint(x, y, isPositive) {
 }
 
 function drawTempBox(x1, y1, x2, y2, label) {
-    // 应用 zoom 缩放，因为此函数在 ctx.restore() 后调用
-    ctx.save();
-    ctx.scale(state.zoom, state.zoom);
-    // 如果传入了 label 参数（boolean），使用它；否则使用当前的 isPositive 状态
-    // 注意：label 可能是 false（负样本），所以要用 typeof 检查
     const isPositive = typeof label === 'boolean' ? label : state.isPositive;
+    ctx.save();
     ctx.strokeStyle = isPositive ? '#4ade80' : '#e94560';
-    ctx.lineWidth = 2 / state.zoom;  // 保持线宽视觉一致
-    ctx.setLineDash([5 / state.zoom, 5 / state.zoom]);
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 5]);
     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    ctx.setLineDash([]);
     ctx.restore();
 }
 
@@ -1052,10 +1216,8 @@ function finishPolygon() {
 
     state.annotations.push(annotation);
     state.tempPolygon = [];
-    invalidateStaticCache();  // 标注变化，更新缓存
-    updateAnnotationList();
-    redraw();
-    showToast('成功', `已添加手动标注: ${className}`);
+    recordAnnotationMutation();
+    showToast('已添加', `${className} · 正在自动保存`);
 }
 
 function cancelPolygon() {
@@ -1086,8 +1248,11 @@ async function segmentManual() {
 
     // 优先分割临时框
     if (state.tempBoxes.length > 0) {
-        await segmentByBoxes(state.tempBoxes);
-        state.tempBoxes = [];
+        const applied = await segmentByBoxes(state.tempBoxes);
+        if (applied) {
+            state.tempBoxes = [];
+            redraw();
+        }
         return;
     }
 
@@ -1099,13 +1264,13 @@ async function segmentManual() {
 
     showToast('提示', '请先绘制框或添加点');
 }
-
-// 清除临时提示（框和点）
+// 清除临时提示。
 function clearTempPrompts() {
     state.tempBoxes = [];
     state.tempPoints = [];
+    state.tempPolygon = [];
     redraw();
-    showToast('提示', '已清除临时标记');
+    showToast('提示', '已清除未完成的临时标记');
 }
 
 async function applySegmentationResults(results, className, emptyMessage, successMessage) {
@@ -1117,9 +1282,7 @@ async function applySegmentationResults(results, className, emptyMessage, succes
         result.class_name = className;
     });
     state.annotations.push(...results);
-    invalidateStaticCache();
-    updateAnnotationList();
-    redraw();
+    recordAnnotationMutation({ autosave: false });
     const saved = await saveAnnotations(false);
     if (saved) {
         showToast('成功', successMessage);
@@ -1131,9 +1294,9 @@ async function applySegmentationResults(results, className, emptyMessage, succes
 
 
 async function segmentByPoints() {
-    if (!state.projectId || state.currentIndex < 0) return;
+    if (!state.projectId || state.currentIndex < 0) return false;
     const className = getCurrentClassName();
-    if (!className) return;
+    if (!className) return false;
 
     const image = state.images[state.currentIndex];
     const points = state.tempPoints.map(point => [
@@ -1154,18 +1317,23 @@ async function segmentByPoints() {
             '请调整正负提示点后重试',
             `检测到 ${data.results.length} 个 \"${className}\"`
         );
-        if (applied) state.tempPoints = [];
+        if (applied) {
+            state.tempPoints = [];
+            redraw();
+        }
+        return applied;
     } catch (error) {
         showToast('点击分割失败', error.message, 'danger');
+        return false;
     } finally {
         hideLoading();
     }
 }
 
 async function segmentByBoxes(boxes) {
-    if (!state.projectId || state.currentIndex < 0) return;
+    if (!state.projectId || state.currentIndex < 0) return false;
     const className = getCurrentClassName();
-    if (!className) return;
+    if (!className) return false;
 
     const image = state.images[state.currentIndex];
     const boxData = boxes.map(box => [
@@ -1182,7 +1350,7 @@ async function segmentByBoxes(boxes) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ image_path: image.path, boxes: boxData })
         });
-        await applySegmentationResults(
+        return await applySegmentationResults(
             data.results,
             className,
             '请调整正负提示框后重试',
@@ -1190,6 +1358,7 @@ async function segmentByBoxes(boxes) {
         );
     } catch (error) {
         showToast('框选分割失败', error.message, 'danger');
+        return false;
     } finally {
         hideLoading();
     }
@@ -1372,6 +1541,10 @@ async function batchSegment() {
         showToast('提示', '请先在类别管理中添加类名', 'warning');
         return;
     }
+    if (state.dirty && !(await saveAnnotations(false))) {
+        showToast('无法开始批处理', '当前图片保存失败，请先重试保存', 'warning');
+        return;
+    }
 
     const prompt = document.getElementById('textPrompt').value.trim();
     if (!prompt) {
@@ -1415,9 +1588,11 @@ async function batchSegment() {
         }
     }
     const translation = wasTranslated ? `\n翻译后: ${actualPrompt}` : '';
-    if (!confirm(
-        `即将处理 ${toProcess.length} 张图片\n类别: ${className}\n提示词: ${prompt}${translation}\n\n确定继续？`
-    )) {
+    if (!(await confirmAction({
+        title: '开始批量分割',
+        message: `即将处理 ${toProcess.length} 张图片\n类别: ${className}\n提示词: ${prompt}${translation}`,
+        confirmText: '开始处理'
+    }))) {
         hideLoading();
         return;
     }
@@ -1426,8 +1601,14 @@ async function batchSegment() {
     let totalDetections = 0;
     const failures = [];
     showLoading(`正在批量分割... 0/${toProcess.length}`, 0);
+    batchCancelRequested = false;
+    const cancelButton = document.getElementById('cancelBatchButton');
+    cancelButton.hidden = false;
+    cancelButton.disabled = false;
+    cancelButton.textContent = '完成当前图片后停止';
     try {
         for (let offset = 0; offset < toProcess.length; offset++) {
+            if (batchCancelRequested) break;
             const imageIndex = toProcess[offset];
             const image = state.images[imageIndex];
             showLoading(
@@ -1473,18 +1654,21 @@ async function batchSegment() {
         }
     } finally {
         updateLoadingProgress(100);
+        document.getElementById('cancelBatchButton').hidden = true;
         hideLoading();
     }
 
-    const summary = `完成 ${processed}/${toProcess.length} 张，新检测 ${totalDetections} 个对象`;
+    const attempted = processed + failures.length;
+    const canceled = attempted < toProcess.length;
+    const summary = `${canceled ? '已停止' : '完成'} ${processed}/${toProcess.length} 张，新检测 ${totalDetections} 个对象`;
     if (failures.length > 0) {
         showToast(
-            '批量分割部分失败',
+            canceled ? '批量分割已停止' : '批量分割部分失败',
             `${summary}；失败 ${failures.length} 张：${failures.slice(0, 2).join('；')}`,
             'warning'
         );
     } else {
-        showToast('批量分割完成', summary);
+        showToast(canceled ? '批量分割已停止' : '批量分割完成', summary, canceled ? 'warning' : 'success');
     }
     updateImageList();
     if (state.currentIndex >= 0) loadImage(state.currentIndex);
@@ -1511,7 +1695,7 @@ async function loadProjects() {
                 <div class="project-item-main">
                     <div class="d-flex justify-content-between align-items-center">
                         <strong>${escapeHtml(project.name)}</strong>
-                        <small class="text-muted">${project.images?.length || 0} 张图片</small>
+                        <small class="text-muted">${project.image_count ?? project.images?.length ?? 0} 张图片</small>
                     </div>
                     <small class="text-muted">${escapeHtml(project.image_dir || '未设置目录')}</small>
                 </div>
@@ -1642,9 +1826,12 @@ async function updateProject() {
 
 // 删除项目
 async function deleteProject(projectId, projectName) {
-    if (!confirm(`确定要删除项目 \"${projectName}\" 吗？\n\n此操作将删除项目及其所有标注数据，不可恢复！`)) {
-        return;
-    }
+    if (!(await confirmAction({
+        title: '删除项目',
+        message: `确定要删除项目 \"${projectName}\" 吗？\n此操作将删除项目及其所有标注数据，不可恢复。`,
+        confirmText: '永久删除',
+        danger: true
+    }))) return;
     try {
         await apiRequest(`/api/project/${projectId}/delete`, {
             method: 'POST',
@@ -1751,6 +1938,10 @@ async function createProject() {
 }
 
 async function selectProject(projectId) {
+    if (state.dirty && !(await saveAnnotations(false))) {
+        showToast('未切换项目', '当前标注尚未保存，请重试', 'warning');
+        return false;
+    }
     try {
         const data = await apiRequest(`/api/project/${projectId}`);
         const project = data.project;
@@ -1777,6 +1968,7 @@ async function selectProject(projectId) {
             loadImage(state.currentIndex);
         } else {
             state.annotations = [];
+            resetAnnotationHistory();
             currentImage = null;
             updateAnnotationList();
             ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -1791,6 +1983,7 @@ async function selectProject(projectId) {
 
 async function loadProjectImages(imageDir = state.imageDir) {
     if (!state.projectId || !imageDir) return false;
+    if (state.dirty && !(await saveAnnotations(false))) return false;
     try {
         const data = await apiRequest(
             `/api/project/${state.projectId}/load_images`,
@@ -1818,7 +2011,43 @@ async function loadProjectImages(imageDir = state.imageDir) {
 
 // ==================== 图片导航 ====================
 
-function updateImageList() {
+function renderImageListWindow() {
+    const list = document.getElementById('imageList');
+    if (state.images.length === 0) {
+        list.innerHTML = '<div class="empty-state"><i class="bi bi-images"></i><p>暂无图片</p></div>';
+        return;
+    }
+    if (filteredImageIndices.length === 0) {
+        list.innerHTML = '<div class="empty-state"><i class="bi bi-search"></i><p>没有匹配的图片</p></div>';
+        return;
+    }
+
+    const viewportHeight = list.clientHeight || 480;
+    const overscan = 8;
+    const start = Math.max(
+        0,
+        Math.floor(list.scrollTop / IMAGE_ROW_HEIGHT) - overscan
+    );
+    const visibleCount = Math.ceil(viewportHeight / IMAGE_ROW_HEIGHT) + overscan * 2;
+    const end = Math.min(filteredImageIndices.length, start + visibleCount);
+    const rows = filteredImageIndices.slice(start, end).map(index => {
+        const image = state.images[index];
+        return `
+            <div class="image-item ${index === state.currentIndex ? 'active' : ''} ${image.annotated ? 'annotated' : ''}"
+                 data-image-index="${index}">
+                <span class="index">${index + 1}</span>
+                <span class="filename" title="${escapeHtml(image.filename)}">${escapeHtml(image.filename)}</span>
+            </div>
+        `;
+    }).join('');
+    list.innerHTML = `
+        <div class="image-list-spacer" style="height:${start * IMAGE_ROW_HEIGHT}px"></div>
+        ${rows}
+        <div class="image-list-spacer" style="height:${(filteredImageIndices.length - end) * IMAGE_ROW_HEIGHT}px"></div>
+    `;
+}
+
+function updateImageList({ scrollCurrent = false } = {}) {
     const list = document.getElementById('imageList');
     const annotatedCount = state.images.filter(image => image.annotated).length;
     const total = state.images.length;
@@ -1827,40 +2056,44 @@ function updateImageList() {
     document.getElementById('progressBar').style.width = `${percent}%`;
     document.getElementById('progressText').textContent =
         `已标注: ${annotatedCount}/${total} (${percent}%)`;
+    document.getElementById('prevImageButton').disabled =
+        total === 0 || state.currentIndex <= 0;
+    document.getElementById('nextImageButton').disabled =
+        total === 0 || state.currentIndex >= total - 1;
 
-    if (total === 0) {
-        list.innerHTML = '<div class="empty-state"><i class="bi bi-images"></i><p>暂无图片</p></div>';
-        return;
+    if (renderedImages !== state.images) {
+        renderedImages = state.images;
+        list.scrollTop = 0;
     }
-    list.innerHTML = state.images.map((image, index) => `
-        <div class="image-item ${index === state.currentIndex ? 'active' : ''} ${image.annotated ? 'annotated' : ''}"
-             data-image-index="${index}">
-            <span class="index">${index + 1}</span>
-            <span class="filename">${escapeHtml(image.filename)}</span>
-        </div>
-    `).join('');
-    list.querySelectorAll('.image-item').forEach(item => {
-        item.addEventListener('click', () => loadImage(Number(item.dataset.imageIndex)));
-    });
+    filteredImageIndices = [];
+    for (let index = 0; index < state.images.length; index++) {
+        if (state.images[index].filename.toLowerCase().includes(imageFilterQuery)) {
+            filteredImageIndices.push(index);
+        }
+    }
+
+    if (scrollCurrent) {
+        const position = filteredImageIndices.indexOf(state.currentIndex);
+        if (position >= 0) {
+            const rowTop = position * IMAGE_ROW_HEIGHT;
+            const rowBottom = rowTop + IMAGE_ROW_HEIGHT;
+            if (rowTop < list.scrollTop || rowBottom > list.scrollTop + list.clientHeight) {
+                list.scrollTop = Math.max(0, rowTop - list.clientHeight / 2);
+            }
+        }
+    }
+    renderImageListWindow();
 }
 
 function filterImages(query) {
-    const items = document.querySelectorAll('.image-item');
-    query = query.toLowerCase();
-
-    items.forEach((item, idx) => {
-        const filename = state.images[idx].filename.toLowerCase();
-        item.style.display = filename.includes(query) ? '' : 'none';
-    });
+    imageFilterQuery = query.trim().toLowerCase();
+    document.getElementById('imageList').scrollTop = 0;
+    updateImageList();
 }
 
 async function loadImage(index) {
     if (index < 0 || index >= state.images.length) return false;
-    if (
-        state.currentIndex !== index &&
-        state.images[state.currentIndex] &&
-        !(await saveAnnotations(false))
-    ) {
+    if (state.dirty && !(await saveAnnotations(false))) {
         showToast('未切换图片', '当前标注保存失败，请先解决保存问题', 'warning');
         return false;
     }
@@ -1869,25 +2102,40 @@ async function loadImage(index) {
     state.annotations = structuredClone(state.images[index].annotations || []);
     state.tempPoints = [];
     state.tempBoxes = [];
-    state.selectedAnnotation = null;
+    state.tempPolygon = [];
+    resetAnnotationHistory();
     invalidateStaticCache();
     saveWorkState();
 
     const image = state.images[index];
+    const loadToken = ++imageLoadToken;
     const nextImage = new Image();
     nextImage.onload = () => {
+        if (loadToken !== imageLoadToken) return;
         currentImage = nextImage;
         fitToView();
         updateAnnotationList();
-        updateImageList();
+        updateImageList({ scrollCurrent: true });
         document.getElementById('currentImageInfo').textContent =
             `${index + 1} / ${state.images.length} - ${image.filename}`;
+        preloadAdjacentImages(index);
     };
     nextImage.onerror = () => {
-        showToast('图片加载失败', image.path, 'danger');
+        if (loadToken === imageLoadToken) {
+            showToast('图片加载失败', image.path, 'danger');
+        }
     };
     nextImage.src = `/api/image/serve?path=${encodeURIComponent(image.path)}`;
     return true;
+}
+
+function preloadAdjacentImages(index) {
+    [index - 1, index + 1].forEach(adjacentIndex => {
+        const image = state.images[adjacentIndex];
+        if (!image) return;
+        const preloader = new Image();
+        preloader.src = `/api/image/serve?path=${encodeURIComponent(image.path)}`;
+    });
 }
 
 function prevImage() {
@@ -1964,18 +2212,12 @@ function selectAnnotationAt(x, y) {
 
 async function deleteAnnotation(id, event) {
     if (event) event.stopPropagation();
-    const previous = structuredClone(state.annotations);
-    state.annotations = state.annotations.filter(annotation => annotation.id !== id);
-    state.selectedAnnotation = null;
-    invalidateStaticCache();
-    updateAnnotationList();
-    redraw();
+    const nextAnnotations = state.annotations.filter(annotation => annotation.id !== id);
+    if (nextAnnotations.length === state.annotations.length) return;
+    state.annotations = nextAnnotations;
+    recordAnnotationMutation({ autosave: false });
     if (!(await saveAnnotations(false))) {
-        state.annotations = previous;
-        invalidateStaticCache();
-        updateAnnotationList();
-        redraw();
-        showToast('删除已撤销', '保存失败，原标注已恢复', 'warning');
+        showToast('删除尚未保存', '标注仍保留在页面，可撤销或重试保存', 'warning');
     }
 }
 
@@ -1985,30 +2227,79 @@ function deleteSelectedAnnotation() {
     }
 }
 
+function scheduleAnnotationAutosave() {
+    clearTimeout(annotationAutosaveTimer);
+    annotationAutosaveTimer = setTimeout(() => {
+        annotationAutosaveTimer = null;
+        saveAnnotations(false);
+    }, 700);
+}
+
 async function saveAnnotations(showMessage = true) {
     if (!state.projectId || state.currentIndex < 0 || !state.images[state.currentIndex]) {
         return false;
     }
-    try {
-        await apiRequest('/api/annotation/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                project_id: state.projectId,
-                image_index: state.currentIndex,
-                annotations: state.annotations
-            })
-        });
-        state.images[state.currentIndex].annotations =
-            structuredClone(state.annotations);
-        state.images[state.currentIndex].annotated = state.annotations.length > 0;
-        updateImageList();
-        if (showMessage) showToast('成功', '标注已安全写入磁盘');
+    if (!state.dirty) {
+        if (showMessage) showToast('已保存', '当前标注没有未保存修改');
         return true;
-    } catch (error) {
-        showToast('保存失败', error.message, 'danger');
-        return false;
     }
+
+    clearTimeout(annotationAutosaveTimer);
+    annotationAutosaveTimer = null;
+    const projectId = state.projectId;
+    const imageIndex = state.currentIndex;
+    const revision = state.revision;
+    const annotations = structuredClone(state.annotations);
+    const saveKey = `${projectId}:${imageIndex}:${revision}`;
+    if (lastQueuedSave?.key === saveKey) {
+        return lastQueuedSave.promise;
+    }
+    updateSaveIndicator('saving');
+
+    const execute = async () => {
+        try {
+            await apiRequest('/api/annotation/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    project_id: projectId,
+                    image_index: imageIndex,
+                    annotations
+                })
+            });
+            if (state.projectId === projectId && state.images[imageIndex]) {
+                state.images[imageIndex].annotations = structuredClone(annotations);
+                state.images[imageIndex].annotated = annotations.length > 0;
+                updateImageList();
+            }
+            if (
+                state.projectId === projectId &&
+                state.currentIndex === imageIndex &&
+                state.revision === revision
+            ) {
+                state.dirty = false;
+                updateSaveIndicator('saved');
+            } else if (state.projectId === projectId && state.currentIndex === imageIndex) {
+                updateSaveIndicator('dirty');
+            }
+            if (showMessage) showToast('成功', '标注已安全写入磁盘');
+            return true;
+        } catch (error) {
+            if (state.projectId === projectId && state.currentIndex === imageIndex) {
+                updateSaveIndicator('error', '保存失败，修改仍在本地');
+            }
+            showToast('保存失败', error.message, 'danger');
+            return false;
+        }
+    };
+
+    const promise = saveQueue.then(execute, execute);
+    saveQueue = promise.then(() => undefined, () => undefined);
+    lastQueuedSave = { key: saveKey, promise };
+    promise.finally(() => {
+        if (lastQueuedSave?.key === saveKey) lastQueuedSave = null;
+    });
+    return promise;
 }
 
 // ==================== 类别管理 ====================
@@ -2078,9 +2369,12 @@ async function removeClass(name) {
     const used = state.annotations.some(
         annotation => (annotation.class_name || annotation.label) === name
     );
-    if (used && !confirm(`当前图片包含类别 \"${name}\" 的标注，仍要从类别列表删除吗？`)) {
-        return;
-    }
+    if (used && !(await confirmAction({
+        title: '删除正在使用的类别',
+        message: `当前图片包含类别 \"${name}\" 的标注，仍要从类别列表删除吗？`,
+        confirmText: '删除类别',
+        danger: true
+    }))) return;
     const previousClasses = state.classes;
     const nextClasses = state.classes.filter(className => className !== name);
     try {
@@ -2178,7 +2472,7 @@ async function generateExportPreview() {
     if (placeholder) placeholder.innerHTML = '<div class="spinner-border spinner-border-sm"></div><p>生成预览中...</p>';
 
     try {
-        const response = await fetch('/api/export/preview', {
+        const data = await apiRequest('/api/export/preview', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2190,31 +2484,17 @@ async function generateExportPreview() {
                 opacity: 0.4
             })
         });
+        previewImage.src = data.preview;
+        previewImage.style.display = 'block';
+        if (placeholder) placeholder.style.display = 'none';
 
-        const data = await response.json();
-        if (data.success) {
-            previewImage.src = data.preview;
-            previewImage.style.display = 'block';
-            if (placeholder) placeholder.style.display = 'none';
-
-            // 显示统计信息
-            const stats = data.stats;
-            const smoothNames = {none: '无平滑', low: '低', medium: '中等', high: '高', ultra: '超高'};
-            statsDiv.innerHTML = `
-                <i class="bi bi-info-circle me-1"></i>
-                文件: ${stats.filename} |
-                标注数: ${stats.total_annotations} |
-                平滑: ${smoothNames[stats.smooth_level]} |
-                尺寸: ${stats.image_size[0]}x${stats.image_size[1]}
-            `;
-            statsDiv.style.display = 'block';
-        } else {
-            showToast('错误', data.error || '生成预览失败', 'danger');
-            if (placeholder) {
-                placeholder.innerHTML = '<i class="bi bi-exclamation-triangle"></i><p>预览生成失败</p>';
-                placeholder.style.display = 'block';
-            }
-        }
+        const stats = data.stats;
+        const smoothNames = {none: '无平滑', low: '低', medium: '中等', high: '高', ultra: '超高'};
+        statsDiv.textContent =
+            `文件: ${stats.filename} | 标注数: ${stats.total_annotations} | ` +
+            `平滑: ${smoothNames[stats.smooth_level]} | ` +
+            `尺寸: ${stats.image_size[0]}x${stats.image_size[1]}`;
+        statsDiv.style.display = 'block';
     } catch (error) {
         showToast('错误', error.message, 'danger');
         if (placeholder) {
@@ -2268,7 +2548,7 @@ async function updateSmoothCompare() {
     gridDiv.style.opacity = '0.3';
 
     try {
-        const response = await fetch('/api/export/preview_compare', {
+        const data = await apiRequest('/api/export/preview_compare', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2277,23 +2557,14 @@ async function updateSmoothCompare() {
                 annotation_index: annotationIndex
             })
         });
-
-        const data = await response.json();
-        if (data.success) {
-            // 更新各级别的预览图片
-            const levels = ['none', 'low', 'medium', 'high', 'ultra'];
-            levels.forEach(level => {
-                const img = document.getElementById(`compare${level.charAt(0).toUpperCase() + level.slice(1)}`);
-                if (img && data.previews[level]) {
-                    img.src = data.previews[level];
-                }
-            });
-
-            // 显示原始点数
-            document.getElementById('compareNoneInfo').textContent = `原始: ${data.original_points} 点`;
-        } else {
-            showToast('错误', data.error || '生成对比失败', 'danger');
-        }
+        const levels = ['none', 'low', 'medium', 'high', 'ultra'];
+        levels.forEach(level => {
+            const img = document.getElementById(`compare${level.charAt(0).toUpperCase() + level.slice(1)}`);
+            if (img && data.previews[level]) {
+                img.src = data.previews[level];
+            }
+        });
+        document.getElementById('compareNoneInfo').textContent = `原始: ${data.original_points} 点`;
     } catch (error) {
         showToast('错误', error.message, 'danger');
     }
@@ -2388,26 +2659,27 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // ==================== 缩放控制 ====================
 
-function zoomIn() {
-    state.zoom = Math.min(5, state.zoom * 1.2);
-    invalidateStaticCache();
-    redraw();
+function applyCanvasZoom() {
+    if (!currentImage) return;
+    canvas.style.width = `${currentImage.naturalWidth * state.zoom}px`;
+    canvas.style.height = `${currentImage.naturalHeight * state.zoom}px`;
     updateZoomDisplay();
+}
+
+function zoomIn() {
+    state.zoom = Math.min(10, state.zoom * 1.2);
+    applyCanvasZoom();
 }
 
 function zoomOut() {
     state.zoom = Math.max(0.1, state.zoom / 1.2);
-    invalidateStaticCache();
-    redraw();
-    updateZoomDisplay();
+    applyCanvasZoom();
 }
 
 function resetZoom() {
     state.zoom = 1;
-    invalidateStaticCache();
-    redraw();
+    applyCanvasZoom();
     centerCanvas();
-    updateZoomDisplay();
 }
 
 // 适应视图 - 让图片完整显示在容器中
@@ -2421,11 +2693,10 @@ function fitToView() {
     const scaleX = containerWidth / currentImage.width;
     const scaleY = containerHeight / currentImage.height;
 
-    state.zoom = Math.min(scaleX, scaleY, 1); // 不超过100%
-    invalidateStaticCache();
+    state.zoom = Math.min(scaleX, scaleY, 1);
     redraw();
+    applyCanvasZoom();
     centerCanvas();
-    updateZoomDisplay();
 }
 
 // 将 canvas 居中显示
@@ -2619,21 +2890,16 @@ async function testAIConfig() {
     resultDiv.style.display = 'block';
 
     try {
-        const response = await fetch('/api/ai/test', {
+        await apiRequest('/api/ai/test', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ api_url: apiUrl, api_key: apiKey, model: model })
+            body: JSON.stringify({ api_url: apiUrl, api_key: apiKey, model })
         });
-
-        const data = await response.json();
-
-        if (data.success) {
-            resultDiv.innerHTML = '<div class="alert alert-success small mb-0"><i class="bi bi-check-circle"></i> 连接成功！API配置有效</div>';
-        } else {
-            resultDiv.innerHTML = `<div class="alert alert-danger small mb-0"><i class="bi bi-x-circle"></i> 连接失败: ${data.error}</div>`;
-        }
+        resultDiv.innerHTML =
+            '<div class="alert alert-success small mb-0">' +
+            '<i class="bi bi-check-circle"></i> 连接成功！API配置有效</div>';
     } catch (error) {
-        resultDiv.innerHTML = `<div class="alert alert-danger small mb-0"><i class="bi bi-x-circle"></i> 请求错误: ${error.message}</div>`;
+        resultDiv.innerHTML = `<div class="alert alert-danger small mb-0"><i class="bi bi-x-circle"></i> 请求错误: ${escapeHtml(error.message)}</div>`;
     }
 }
 
@@ -2663,8 +2929,13 @@ function saveAIConfig() {
 }
 
 // 清除AI配置
-function clearAIConfig() {
-    if (!confirm('确定要清除AI配置吗？')) return;
+async function clearAIConfig() {
+    if (!(await confirmAction({
+        title: '清除 AI 配置',
+        message: '确定要清除保存的 API 地址、密钥和模型配置吗？',
+        confirmText: '清除',
+        danger: true
+    }))) return;
 
     aiConfig.enabled = false;
     aiConfig.apiUrl = '';
@@ -2697,26 +2968,19 @@ async function translatePrompt(text) {
     }
 
     try {
-        const response = await fetch('/api/ai/translate', {
+        const data = await apiRequest('/api/ai/translate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                text: text,
+                text,
                 api_url: aiConfig.apiUrl,
                 api_key: aiConfig.apiKey,
                 model: aiConfig.model
             })
         });
 
-        const data = await response.json();
-
-        if (data.success) {
-            console.log(`[AI翻译] "${text}" -> "${data.translated}"`);
-            return { success: true, text: data.translated, original: text, translated: true };
-        } else {
-            console.warn('[AI翻译失败]', data.error);
-            return { success: false, text: text, error: data.error };
-        }
+        console.log(`[AI翻译] "${text}" -> "${data.translated}"`);
+        return { success: true, text: data.translated, original: text, translated: true };
     } catch (error) {
         console.error('[AI翻译错误]', error);
         return { success: false, text: text, error: error.message };

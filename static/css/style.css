@@ -374,8 +374,9 @@ body {
 }
 
 .image-item {
-    padding: 10px 16px;
-    margin-bottom: 1px;
+    height: 40px;
+    padding: 0 16px;
+    box-sizing: border-box;
     background: transparent;
     border-left: 2px solid transparent;
     cursor: pointer;
@@ -386,6 +387,11 @@ body {
     transition: var(--transition);
     position: relative;
     overflow: hidden;
+}
+
+.image-list-spacer {
+    width: 1px;
+    pointer-events: none;
 }
 
 .image-item:hover {
@@ -793,7 +799,7 @@ body {
 }
 
 .image-info {
-    flex: 1;
+    flex: 0 1 40%;
     text-align: center;
     font-family: 'Courier New', monospace;
     color: var(--text-secondary);
@@ -801,8 +807,44 @@ body {
     letter-spacing: 1px;
 }
 
+.tool-hint {
+    flex: 1;
+    min-width: 0;
+    color: var(--text-muted);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.save-status {
+    align-self: center;
+    color: var(--text-muted);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.save-status.dirty,
+.save-status.saving {
+    color: var(--warning);
+}
+
+.save-status.error {
+    color: var(--danger);
+}
+
+.save-status.saved {
+    color: var(--success);
+}
+
+.confirm-message {
+    white-space: pre-line;
+    line-height: 1.6;
+}
+
 .action-buttons {
     display: flex;
+    align-items: center;
     gap: 8px;
 }
 
