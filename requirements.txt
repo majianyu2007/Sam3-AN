@@ -16,7 +16,8 @@ iopath>=0.1.10
 typing_extensions
 huggingface_hub
 einops
-decord
+decord; sys_platform != "darwin"
+eva-decord; sys_platform == "darwin"
 psutil
 
 pycocotools>=2.0.6
@@ -25,5 +26,5 @@ PyYAML>=6.0
 
 requests>=2.28.0
 
-triton-windows
+triton-windows; sys_platform == "win32"
 orjson
