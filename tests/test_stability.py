@@ -673,6 +673,97 @@ class ExporterContractTests(unittest.TestCase):
                 for image in manifest["images"]
             ))
 
+    def test_split_is_reproducible_and_keeps_training_nonempty(self):
+        images = []
+        for index in range(10):
+            filename = f"split-{index}.png"
+            Image.new("RGB", (20, 20), "white").save(
+                self.source / filename
+            )
+            images.append(self.image_record(filename))
+        project = {
+            "id": "stable-project",
+            "name": "dataset",
+            "classes": ["legacy"],
+            "images": images,
+        }
+
+        assignments = []
+        for output_name in ("split-a", "split-b"):
+            output = self.root / output_name
+            stats = YOLOExporter().export(
+                project,
+                str(output),
+                smooth_level="none",
+            )
+            assignments.append({
+                split: sorted(
+                    path.name
+                    for path in (output / "images" / split).iterdir()
+                )
+                for split in ("train", "val", "test")
+            })
+            self.assertEqual(
+                [stats["train"], stats["val"], stats["test"]],
+                [8, 1, 1],
+            )
+        self.assertEqual(assignments[0], assignments[1])
+
+        single = YOLOExporter().export(
+            {
+                **project,
+                "images": [self.image_record("one.png")],
+            },
+            str(self.root / "single"),
+            smooth_level="none",
+        )
+        self.assertEqual(single["train"], 1)
+        self.assertEqual(single["val"] + single["test"], 0)
+
+    def test_segment_exports_convert_bbox_only_annotations(self):
+        bbox_image = {
+            "filename": "one.png",
+            "path": str(self.source / "one.png"),
+            "annotated": True,
+            "annotations": [{
+                "id": "bbox-only",
+                "class_name": "legacy",
+                "bbox": [2, 3, 18, 17],
+            }],
+        }
+        project = {
+            "id": "bbox-project",
+            "name": "dataset",
+            "classes": ["legacy"],
+            "images": [bbox_image],
+        }
+
+        yolo_output = self.root / "bbox-yolo"
+        yolo_stats = YOLOExporter().export(
+            project,
+            str(yolo_output),
+            smooth_level="none",
+        )
+        yolo_fields = next(
+            (yolo_output / "labels").rglob("one.txt")
+        ).read_text().split()
+        self.assertEqual(len(yolo_fields), 9)
+        self.assertEqual(yolo_stats["converted_bbox_annotations"], 1)
+
+        coco_output = self.root / "bbox-coco"
+        coco_stats = COCOExporter().export(
+            project,
+            str(coco_output),
+            smooth_level="none",
+        )
+        coco_annotations = [
+            annotation
+            for path in (coco_output / "annotations").glob("*.json")
+            for annotation in json.loads(path.read_text())["annotations"]
+        ]
+        self.assertEqual(len(coco_annotations[0]["segmentation"][0]), 8)
+        self.assertEqual(coco_stats["converted_bbox_annotations"], 1)
+
 
 class ServiceConcurrencyTests(unittest.TestCase):
     def test_lazy_service_is_constructed_once(self):

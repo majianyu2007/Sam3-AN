@@ -1,6 +1,7 @@
 import os
 import hmac
 import ipaddress
+import logging
 import secrets
 import sys
 import subprocess
@@ -1508,6 +1509,12 @@ def _find_available_port(
 
 
 if __name__ == '__main__':
+    log_level_name = os.environ.get('SAM3_LOG_LEVEL', 'INFO').upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format='[%(levelname)s] %(message)s',
+    )
     print("=" * 50)
     print("SAM3 AN - 数据标注工具")
     print("=" * 50)

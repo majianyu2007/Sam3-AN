@@ -7,6 +7,7 @@ from PIL import Image, ImageOps
 import yaml
 import numpy as np
 import cv2
+from exports.export_utils import bbox_polygon, clamp_bbox, deterministic_splits
 
 
 class YOLOExporter:
@@ -154,14 +155,20 @@ class YOLOExporter:
         stems = [Path(str(image.get('filename', ''))).stem for _, image in images]
         if len(stems) != len(set(stems)):
             raise ValueError("存在同名但扩展名不同的图片，YOLO 标签文件会冲突")
-        train_end = int(len(images) * split_ratio[0])
-        val_end = train_end + int(len(images) * split_ratio[1])
-        splits = {
-            'train': images[:train_end],
-            'val': images[train_end:val_end],
-            'test': images[val_end:],
+        splits, split_seed = deterministic_splits(
+            images,
+            split_ratio,
+            project.get('export_seed')
+            or project.get('id')
+            or project.get('name', 'dataset'),
+        )
+        stats = {
+            'train': 0,
+            'val': 0,
+            'test': 0,
+            'total_annotations': 0,
+            'converted_bbox_annotations': 0,
         }
-        stats = {'train': 0, 'val': 0, 'test': 0, 'total_annotations': 0}
 
         with tempfile.TemporaryDirectory(
             prefix='.sam3-yolo-',
@@ -173,7 +180,7 @@ class YOLOExporter:
                 (staging_path / 'labels' / split).mkdir(parents=True)
             for split_name, split_images in splits.items():
                 for image_index, image in split_images:
-                    annotation_count = self._export_image(
+                    annotation_count, converted_count = self._export_image(
                         image,
                         self._annotations_for(
                             image,
@@ -187,6 +194,7 @@ class YOLOExporter:
                     if annotation_count:
                         stats[split_name] += 1
                         stats['total_annotations'] += annotation_count
+                        stats['converted_bbox_annotations'] += converted_count
             self._generate_yaml(
                 staging_path,
                 classes,
@@ -197,6 +205,7 @@ class YOLOExporter:
 
         stats['classes'] = classes
         stats['output_dir'] = str(output_path)
+        stats['split_seed'] = split_seed
         return stats
 
     def _resolve_classes(self, project: dict, annotation_loader=None) -> list:
@@ -265,11 +274,11 @@ class YOLOExporter:
 
     def _export_image(self, img_info: dict, annotations: list,
                       output_path: Path, split: str,
-                      class_to_id: dict) -> int:
+                      class_to_id: dict) -> tuple[int, int]:
         """导出一张至少含一个有效标签的图片。"""
         src_path = img_info.get('path')
         if not src_path or not os.path.isfile(src_path):
-            return 0
+            return 0, 0
         filename = str(img_info.get('filename') or '')
         if not filename or Path(filename).name != filename:
             raise ValueError(f"图片文件名无效: {filename!r}")
@@ -277,9 +286,10 @@ class YOLOExporter:
             image = ImageOps.exif_transpose(source)
             image_width, image_height = image.size
         if image_width <= 0 or image_height <= 0:
-            return 0
+            return 0, 0
 
         lines = []
+        converted_bbox_annotations = 0
         for annotation in annotations:
             class_name = str(
                 annotation.get('class_name')
@@ -287,14 +297,24 @@ class YOLOExporter:
                 or 'object'
             ).strip()
             class_id = class_to_id[class_name]
-            if self.format_type == 'segment' and annotation.get('polygon'):
+            if self.format_type == 'segment':
                 polygon = self.clamp_polygon(
-                    annotation['polygon'],
+                    annotation.get('polygon', []),
                     image_width,
                     image_height,
                 )
+                converted_from_bbox = False
                 if len(polygon) < 3:
-                    continue
+                    bbox = clamp_bbox(
+                        annotation.get('bbox'),
+                        image_width,
+                        image_height,
+                        filename,
+                    )
+                    if bbox is None:
+                        continue
+                    polygon = bbox_polygon(bbox)
+                    converted_from_bbox = True
                 smoothed = self.smooth_polygon(
                     polygon,
                     self.current_smooth_level,
@@ -307,20 +327,19 @@ class YOLOExporter:
                     y = min(max(float(point[1]) / image_height, 0.0), 1.0)
                     coordinates.extend([f"{x:.6f}", f"{y:.6f}"])
                 lines.append(f"{class_id} " + " ".join(coordinates))
+                if converted_from_bbox:
+                    converted_bbox_annotations += 1
                 continue
 
-            bbox = annotation.get('bbox', [])
-            if len(bbox) < 4:
+            bbox = clamp_bbox(
+                annotation.get('bbox'),
+                image_width,
+                image_height,
+                filename,
+            )
+            if bbox is None:
                 continue
-            x1, y1, x2, y2 = (float(value) for value in bbox[:4])
-            if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
-                raise ValueError(f"图片 {filename} 包含非有限边界框坐标")
-            x1 = min(max(x1, 0.0), float(image_width))
-            x2 = min(max(x2, 0.0), float(image_width))
-            y1 = min(max(y1, 0.0), float(image_height))
-            y2 = min(max(y2, 0.0), float(image_height))
-            if x2 <= x1 or y2 <= y1:
-                continue
+            x1, y1, x2, y2 = bbox
             x_center = (x1 + x2) / 2 / image_width
             y_center = (y1 + y2) / 2 / image_height
             width = (x2 - x1) / image_width
@@ -330,11 +349,11 @@ class YOLOExporter:
                 f"{width:.6f} {height:.6f}"
             )
         if not lines:
-            return 0
+            return 0, converted_bbox_annotations
         label_path = output_path / 'labels' / split / f"{Path(filename).stem}.txt"
         label_path.write_text('\n'.join(lines), encoding='utf-8')
         shutil.copy2(src_path, output_path / 'images' / split / filename)
-        return len(lines)
+        return len(lines), converted_bbox_annotations
 
     def _generate_yaml(
         self,

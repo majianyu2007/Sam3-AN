@@ -1,6 +1,7 @@
 """
 SAM3模型服务封装 - 修正版
 """
+import logging
 import os
 import sys
 from pathlib import Path
@@ -8,9 +9,10 @@ import numpy as np
 from PIL import Image, ImageOps
 import torch
 import uuid
-import traceback
 import threading
 from functools import wraps
+
+logger = logging.getLogger(__name__)
 
 # 使用本地 SAM_src 目录
 sam3_src = Path(__file__).parent.parent / "SAM_src"
@@ -26,12 +28,12 @@ def _select_device() -> str:
     env = os.environ.get("SAM3_DEVICE", "").strip().lower()
     if env in ("cuda", "mps", "cpu"):
         if env == "cuda" and not torch.cuda.is_available():
-            print("[WARN] SAM3_DEVICE=cuda 但未检测到 CUDA，回退到 CPU")
+            logger.warning("SAM3_DEVICE=cuda 但未检测到 CUDA，回退到 CPU")
             return "cpu"
         if env == "mps" and not (
             getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
         ):
-            print("[WARN] SAM3_DEVICE=mps 但未检测到 MPS，回退到 CPU")
+            logger.warning("SAM3_DEVICE=mps 但未检测到 MPS，回退到 CPU")
             return "cpu"
         return env
     if torch.cuda.is_available():
@@ -69,7 +71,7 @@ class SAM3Service:
         if self.image_model is not None and self.image_processor is not None:
             return
 
-        print("正在加载SAM3图像模型...")
+        logger.info("正在加载 SAM3 图像模型")
 
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -81,7 +83,7 @@ class SAM3Service:
         # 选择运行设备：CUDA > MPS (macOS) > CPU
         # 可通过环境变量 SAM3_DEVICE 强制指定（如遇 MPS 算子不支持时设为 cpu）
         self.device = _select_device()
-        print(f"[INFO] 使用设备: {self.device}")
+        logger.info("使用推理设备: %s", self.device)
 
         bpe_path = sam3_src / "assets" / "bpe_simple_vocab_16e6.txt.gz"
         image_model = build_sam3_image_model(
@@ -92,19 +94,19 @@ class SAM3Service:
         self.image_model = image_model
         self.image_processor = image_processor
 
-        print("SAM3图像模型加载完成")
+        logger.info("SAM3 图像模型加载完成")
 
     def _load_image(self, image_path: str):
         """加载图像"""
         if self.current_image_path != image_path or self.inference_state is None:
-            print(f"[DEBUG] 加载图像: {image_path}")
+            logger.debug("加载图像: %s", image_path)
             with Image.open(image_path) as source:
                 # 处理 EXIF 旋转信息，修复竖屏图像分割偏移问题
                 image = ImageOps.exif_transpose(source).convert('RGB')
             self._image_size = image.size
             self.inference_state = self.image_processor.set_image(image)
             self.current_image_path = image_path
-            print(f"[DEBUG] 图像尺寸: {self._image_size}")
+            logger.debug("图像尺寸: %s", self._image_size)
 
     def _smooth_mask(self, mask: np.ndarray, smooth_level: str) -> np.ndarray:
         """在 mask 级别进行形态学平滑，从根本上消除锯齿
@@ -241,7 +243,11 @@ class SAM3Service:
             self._init_image_model()
             self._load_image(image_path)
 
-            print(f"[DEBUG] 文本分割: prompt='{prompt}', confidence={confidence}")
+            logger.debug(
+                "文本分割: prompt=%r, confidence=%s",
+                prompt,
+                confidence,
+            )
 
             # 设置置信度
             self.image_processor.confidence_threshold = confidence
@@ -252,13 +258,15 @@ class SAM3Service:
                 prompt=prompt
             )
 
-            print(f"[DEBUG] 输出keys: {list(output.keys()) if output else 'None'}")
+            logger.debug(
+                "模型输出 keys: %s",
+                output.keys() if output else None,
+            )
 
             return self._extract_results(output, prompt)
 
         except Exception as error:
-            print(f"[ERROR] segment_by_text: {error}")
-            traceback.print_exc()
+            logger.exception("文本分割失败")
             raise RuntimeError(f"文本分割失败: {error}") from error
 
     @_serialized_inference
@@ -280,23 +288,33 @@ class SAM3Service:
             positive_points = []
             negative_points = []
 
-            print(f"[DEBUG] 点击分割: 共 {len(points)} 个点")
+            logger.debug("点击分割提示点数量: %d", len(points))
             for i, p in enumerate(points):
                 x, y, label = p
                 is_positive = label == 1
                 label_str = "正样本(+)" if is_positive else "负样本(-)"
-                print(f"[DEBUG]   点{i}: ({x:.1f}, {y:.1f}) {label_str}")
+                logger.debug(
+                    "提示点 %d: (%.1f, %.1f) %s",
+                    i,
+                    x,
+                    y,
+                    label_str,
+                )
 
                 if is_positive:
                     positive_points.append([x, y])
                 else:
                     negative_points.append([x, y])
 
-            print(f"[DEBUG] 正样本点: {len(positive_points)}, 负样本点: {len(negative_points)}")
+            logger.debug(
+                "正样本点: %d, 负样本点: %d",
+                len(positive_points),
+                len(negative_points),
+            )
 
             # 如果没有正样本点，无法分割
             if not positive_points:
-                print("[DEBUG] 没有正样本点，无法分割")
+                logger.debug("没有正样本点，跳过分割")
                 return []
 
             width, height = self._image_size
@@ -325,8 +343,7 @@ class SAM3Service:
             return self.segment_by_boxes(image_path, boxes)
 
         except Exception as error:
-            print(f"[ERROR] segment_by_points: {error}")
-            traceback.print_exc()
+            logger.exception("点击分割失败")
             raise RuntimeError(f"点击分割失败: {error}") from error
 
     def _mask_in_negative_region(self, mask: np.ndarray, negative_boxes: list, threshold: float = 0.5) -> bool:
@@ -420,24 +437,36 @@ class SAM3Service:
                 is_positive = bool(label)
 
                 label_str = "正样本(+)" if is_positive else "负样本(-)"
-                print(f"[DEBUG] 框{i}: [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}] {label_str}")
+                logger.debug(
+                    "提示框 %d: [%.1f, %.1f, %.1f, %.1f] %s",
+                    i,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    label_str,
+                )
 
                 if is_positive:
                     positive_boxes_px.append([x1, y1, x2, y2])
                 else:
                     negative_boxes_px.append([x1, y1, x2, y2])
 
-            print(f"[DEBUG] 正样本框: {len(positive_boxes_px)}, 负样本框: {len(negative_boxes_px)}")
+            logger.debug(
+                "正样本框: %d, 负样本框: %d",
+                len(positive_boxes_px),
+                len(negative_boxes_px),
+            )
 
             # 如果没有正样本框，无法分割
             if not positive_boxes_px:
-                print("[DEBUG] 没有正样本框，无法分割")
+                logger.debug("没有正样本框，跳过分割")
                 return []
 
             # 重置 geometric_prompt
             if "geometric_prompt" in self.inference_state:
                 del self.inference_state["geometric_prompt"]
-            print("[DEBUG] 已重置 geometric_prompt")
+            logger.debug("已重置 geometric_prompt")
 
             width, height = self._image_size
             output = None
@@ -450,7 +479,7 @@ class SAM3Service:
                 w = (x2 - x1) / width
                 h = (y2 - y1) / height
                 norm_box = [cx, cy, w, h]
-                print(f"[DEBUG] 添加正样本框{i}: {norm_box}")
+                logger.debug("添加正样本框 %d: %s", i, norm_box)
                 output = self.image_processor.add_geometric_prompt(
                     norm_box, True, self.inference_state
                 )
@@ -463,7 +492,7 @@ class SAM3Service:
                 w = (x2 - x1) / width
                 h = (y2 - y1) / height
                 norm_box = [cx, cy, w, h]
-                print(f"[DEBUG] 添加负样本框{i}: {norm_box}")
+                logger.debug("添加负样本框 %d: %s", i, norm_box)
                 output = self.image_processor.add_geometric_prompt(
                     norm_box, False, self.inference_state
                 )
@@ -471,7 +500,10 @@ class SAM3Service:
             if output is None:
                 return []
 
-            print(f"[DEBUG] 输出keys: {list(output.keys()) if output else 'None'}")
+            logger.debug(
+                "模型输出 keys: %s",
+                output.keys() if output else None,
+            )
 
             # 提取结果（带 mask 数据用于后处理）
             results = self._extract_results_with_mask(output, "box_prompt", negative_boxes_px)
@@ -479,8 +511,7 @@ class SAM3Service:
             return results
 
         except Exception as error:
-            print(f"[ERROR] segment_by_boxes: {error}")
-            traceback.print_exc()
+            logger.exception("框选分割失败")
             raise RuntimeError(f"框选分割失败: {error}") from error
 
     def _extract_results_with_mask(self, output: dict, label: str, negative_boxes: list) -> list:
@@ -488,14 +519,19 @@ class SAM3Service:
         results = []
 
         if output is None:
-            print("[DEBUG] output is None")
+            logger.debug("模型未返回结果")
             return results
 
         masks = output.get('masks', [])
         boxes = output.get('boxes', [])
         scores = output.get('scores', [])
 
-        print(f"[DEBUG] 原始结果: masks={len(masks)}, boxes={len(boxes)}, scores={len(scores)}")
+        logger.debug(
+            "原始结果: masks=%d, boxes=%d, scores=%d",
+            len(masks),
+            len(boxes),
+            len(scores),
+        )
 
         filtered_count = 0
         for i, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
@@ -505,11 +541,20 @@ class SAM3Service:
 
                 # 使用 mask 级别的负样本过滤
                 if negative_boxes and self._mask_in_negative_region(mask_np, negative_boxes, threshold=0.4):
-                    print(f"[DEBUG] 结果{i}: score={float(score):.4f} - 被负样本区域过滤")
+                    logger.debug(
+                        "结果 %d (score=%.4f) 被负样本区域过滤",
+                        i,
+                        float(score),
+                    )
                     filtered_count += 1
                     continue
 
-                print(f"[DEBUG] 结果{i}: score={float(score):.4f}, bbox={[f'{v:.1f}' for v in box_np]}")
+                logger.debug(
+                    "结果 %d: score=%.4f, bbox=%s",
+                    i,
+                    float(score),
+                    box_np,
+                )
 
                 polygon = self._mask_to_polygon(mask_np)
 
@@ -522,10 +567,10 @@ class SAM3Service:
                     'area': float(mask_np.sum()),
                 })
             except Exception as e:
-                print(f"[ERROR] 提取结果{i}失败: {e}")
+                logger.exception("提取结果 %d 失败", i)
 
         if filtered_count > 0:
-            print(f"[DEBUG] 负样本过滤: 排除了 {filtered_count} 个结果")
+            logger.debug("负样本过滤结果数: %d", filtered_count)
 
         return results
 
@@ -534,21 +579,31 @@ class SAM3Service:
         results = []
 
         if output is None:
-            print("[DEBUG] output is None")
+            logger.debug("模型未返回结果")
             return results
 
         masks = output.get('masks', [])
         boxes = output.get('boxes', [])
         scores = output.get('scores', [])
 
-        print(f"[DEBUG] 结果: masks={len(masks)}, boxes={len(boxes)}, scores={len(scores)}")
+        logger.debug(
+            "结果: masks=%d, boxes=%d, scores=%d",
+            len(masks),
+            len(boxes),
+            len(scores),
+        )
 
         for i, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
             try:
                 mask_np = mask[0].cpu().numpy()
                 box_np = box.cpu().numpy().tolist()
 
-                print(f"[DEBUG] 结果{i}: score={float(score):.4f}, bbox={box_np}")
+                logger.debug(
+                    "结果 %d: score=%.4f, bbox=%s",
+                    i,
+                    float(score),
+                    box_np,
+                )
 
                 polygon = self._mask_to_polygon(mask_np)
 
@@ -561,7 +616,7 @@ class SAM3Service:
                     'area': float(mask_np.sum()),
                 })
             except Exception as e:
-                print(f"[ERROR] 提取结果{i}失败: {e}")
+                logger.exception("提取结果 %d 失败", i)
 
         return results
 
@@ -571,12 +626,12 @@ class SAM3Service:
         if self.video_predictor is not None:
             return
 
-        print("正在加载SAM3视频模型...")
+        logger.info("正在加载 SAM3 视频模型")
         from sam3.model_builder import build_sam3_video_predictor
 
         gpus = range(torch.cuda.device_count()) if torch.cuda.is_available() else []
         self.video_predictor = build_sam3_video_predictor(gpus_to_use=gpus)
-        print("SAM3视频模型加载完成")
+        logger.info("SAM3 视频模型加载完成")
 
     def _require_video_session(self, session_id: str):
         if session_id not in self.video_sessions:

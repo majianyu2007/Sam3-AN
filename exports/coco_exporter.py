@@ -12,6 +12,7 @@ from datetime import datetime
 from PIL import Image, ImageOps
 import numpy as np
 import cv2
+from exports.export_utils import bbox_polygon, clamp_bbox, deterministic_splits
 
 
 class COCOExporter:
@@ -128,14 +129,20 @@ class COCOExporter:
         filenames = [str(image.get('filename') or '') for _, image in images]
         if len(filenames) != len(set(filenames)):
             raise ValueError("项目中存在重复图片文件名")
-        train_end = int(len(images) * split_ratio[0])
-        val_end = train_end + int(len(images) * split_ratio[1])
-        splits = {
-            'train': images[:train_end],
-            'val': images[train_end:val_end],
-            'test': images[val_end:],
+        splits, split_seed = deterministic_splits(
+            images,
+            split_ratio,
+            project.get('export_seed')
+            or project.get('id')
+            or project.get('name', 'dataset'),
+        )
+        stats = {
+            'train': 0,
+            'val': 0,
+            'test': 0,
+            'total_annotations': 0,
+            'converted_bbox_annotations': 0,
         }
-        stats = {'train': 0, 'val': 0, 'test': 0, 'total_annotations': 0}
 
         with tempfile.TemporaryDirectory(
             prefix='.sam3-coco-',
@@ -148,7 +155,7 @@ class COCOExporter:
             annotations_path.mkdir()
             for split_name, split_images in splits.items():
                 coco_data = self._create_coco_structure(project, classes)
-                image_count, annotation_count = self._export_split(
+                image_count, annotation_count, converted_count = self._export_split(
                     split_images,
                     staging_path,
                     split_name,
@@ -163,10 +170,12 @@ class COCOExporter:
                     json.dump(coco_data, file, ensure_ascii=False, indent=2)
                 stats[split_name] = image_count
                 stats['total_annotations'] += annotation_count
+                stats['converted_bbox_annotations'] += converted_count
             self._publish(staging_path, output_path)
 
         stats['classes'] = classes
         stats['output_dir'] = str(output_path)
+        stats['split_seed'] = split_seed
         return stats
 
     def _resolve_classes(self, project: dict, annotation_loader=None) -> list:
@@ -266,7 +275,7 @@ class COCOExporter:
         classes: list,
         export_type: str = 'segment',
         annotation_loader=None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         """导出单个数据集分割，并返回实际图片和标注数量。"""
         class_to_id = {
             class_name: index + 1
@@ -275,6 +284,7 @@ class COCOExporter:
         annotation_id = 1
         exported_images = 0
         total_annotations = 0
+        converted_bbox_annotations = 0
 
         for image_index, img_info in images:
             src_path = img_info.get('path')
@@ -316,14 +326,24 @@ class COCOExporter:
                     'category_id': class_to_id[class_name],
                     'iscrowd': 0,
                 }
-                if export_type == 'segment' and annotation.get('polygon'):
+                if export_type == 'segment':
                     polygon = self._clamp_polygon(
-                        annotation['polygon'],
+                        annotation.get('polygon', []),
                         image_width,
                         image_height,
                     )
+                    converted_from_bbox = False
                     if len(polygon) < 3:
-                        continue
+                        bbox = clamp_bbox(
+                            annotation.get('bbox'),
+                            image_width,
+                            image_height,
+                            filename,
+                        )
+                        if bbox is None:
+                            continue
+                        polygon = bbox_polygon(bbox)
+                        converted_from_bbox = True
                     smoothed = self.smooth_polygon(
                         polygon,
                         self.current_smooth_level,
@@ -361,24 +381,18 @@ class COCOExporter:
                         y_max - y_min,
                     ]
                     coco_annotation['area'] = area
+                    if converted_from_bbox:
+                        converted_bbox_annotations += 1
                 else:
-                    bbox = annotation.get('bbox')
-                    if not bbox or len(bbox) < 4:
+                    bbox = clamp_bbox(
+                        annotation.get('bbox'),
+                        image_width,
+                        image_height,
+                        filename,
+                    )
+                    if bbox is None:
                         continue
-                    x1, y1, x2, y2 = (float(value) for value in bbox[:4])
-                    if not all(
-                        math.isfinite(value)
-                        for value in (x1, y1, x2, y2)
-                    ):
-                        raise ValueError(
-                            f"图片 {filename} 包含非有限边界框坐标"
-                        )
-                    x1 = min(max(x1, 0.0), float(image_width))
-                    x2 = min(max(x2, 0.0), float(image_width))
-                    y1 = min(max(y1, 0.0), float(image_height))
-                    y2 = min(max(y2, 0.0), float(image_height))
-                    if x2 <= x1 or y2 <= y1:
-                        continue
+                    x1, y1, x2, y2 = bbox
                     coco_annotation['bbox'] = [
                         x1,
                         y1,
@@ -390,7 +404,7 @@ class COCOExporter:
                 coco_data['annotations'].append(coco_annotation)
                 annotation_id += 1
                 total_annotations += 1
-        return exported_images, total_annotations
+        return exported_images, total_annotations, converted_bbox_annotations
 
     @staticmethod
     def _publish(staging_path: Path, output_path: Path):
