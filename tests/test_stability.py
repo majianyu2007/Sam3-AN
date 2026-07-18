@@ -5,6 +5,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import unquote
 
 from PIL import Image
 
@@ -284,8 +285,12 @@ class FlaskContractTests(unittest.TestCase):
         app_module.annotation_manager = self.manager
         self.original_access_token = app_module.app.config.get("ACCESS_TOKEN")
         self.original_content_limit = app_module.app.config["MAX_CONTENT_LENGTH"]
+        self.original_video_enabled = app_module.app.config.get(
+            "ENABLE_EXPERIMENTAL_VIDEO"
+        )
         app_module.app.config["ACCESS_TOKEN"] = None
         app_module.app.config.update(TESTING=True)
+        app_module.app.config["ENABLE_EXPERIMENTAL_VIDEO"] = True
         self.client = app_module.app.test_client()
 
     def tearDown(self):
@@ -293,6 +298,9 @@ class FlaskContractTests(unittest.TestCase):
         app_module.annotation_manager = self.original_manager
         app_module.app.config["ACCESS_TOKEN"] = self.original_access_token
         app_module.app.config["MAX_CONTENT_LENGTH"] = self.original_content_limit
+        app_module.app.config["ENABLE_EXPERIMENTAL_VIDEO"] = (
+            self.original_video_enabled
+        )
         self.temp_dir.cleanup()
 
     def create_project(self):
@@ -376,6 +384,44 @@ class FlaskContractTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertFalse(invalid.get_json()["success"])
 
+    def test_preview_endpoint_streams_jpeg_with_metadata(self):
+        project = self.create_project()
+        self.client.post(
+            f"/api/project/{project['id']}/load_images",
+            json={"image_dir": str(self.images_dir)},
+        )
+        self.client.post(
+            "/api/annotation/save",
+            json={
+                "project_id": project["id"],
+                "image_index": 0,
+                "annotations": [{
+                    "id": "polygon",
+                    "class_name": "cat",
+                    "bbox": [1, 1, 14, 10],
+                    "polygon": [[1, 1], [14, 1], [14, 10], [1, 10]],
+                }],
+            },
+        )
+
+        preview = self.client.post(
+            "/api/export/preview",
+            json={
+                "project_id": project["id"],
+                "image_index": 0,
+                "smooth_level": "none",
+            },
+        )
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.mimetype, "image/jpeg")
+        self.assertTrue(preview.data.startswith(b"\xff\xd8"))
+        stats = json.loads(unquote(
+            preview.headers["X-SAM3-Preview-Stats"]
+        ))
+        self.assertEqual(stats["total_annotations"], 1)
+        self.assertEqual(stats["filename"], "cat.png")
+
+
     def test_annotation_payload_limits_and_geometry_validation(self):
         project = self.create_project()
         self.client.post(
@@ -420,6 +466,14 @@ class FlaskContractTests(unittest.TestCase):
         self.assertTrue(response.is_json)
         self.assertFalse(response.get_json()["success"])
 
+    def test_experimental_video_routes_are_disabled_by_default(self):
+        app_module.app.config["ENABLE_EXPERIMENTAL_VIDEO"] = False
+        page = self.client.get("/video")
+        api = self.client.post("/api/video/start_session", json={})
+        self.assertEqual(page.status_code, 404)
+        self.assertEqual(api.status_code, 404)
+        self.assertIn("实验性视频", api.get_json()["error"])
+
     def test_cross_origin_writes_are_rejected_without_cors(self):
         response = self.client.post(
             "/api/project/create",
@@ -451,7 +505,6 @@ class FlaskContractTests(unittest.TestCase):
     def test_malformed_json_always_returns_json_error(self):
         for route in (
             "/api/export/preview",
-            "/api/export/preview_compare",
             "/api/video/start_session",
             "/api/video/add_prompt",
             "/api/video/propagate",
@@ -778,6 +831,27 @@ class ServiceConcurrencyTests(unittest.TestCase):
             self.assertTrue(all(service is sentinel for service in services))
         finally:
             app_module.sam3_service = original
+
+    def test_video_session_and_prompt_limits(self):
+        service = SAM3Service()
+        service.video_predictor = object()
+        service.video_sessions = {
+            f"session-{index}": {}
+            for index in range(4)
+        }
+        with self.assertRaisesRegex(ValueError, "视频会话不能超过"):
+            service.start_video_session("unused")
+
+        service.video_sessions = {"active": {}}
+        with self.assertRaisesRegex(ValueError, "文本提示不能超过"):
+            service.add_video_prompt("active", 0, "text", "x" * 501)
+        with self.assertRaisesRegex(ValueError, "points 和 labels 无效"):
+            service.add_video_prompt(
+                "active",
+                0,
+                "points",
+                {"points": [[float("nan"), 0]], "labels": [1]},
+            )
 
     def test_service_re_raises_model_failures(self):
         service = SAM3Service()

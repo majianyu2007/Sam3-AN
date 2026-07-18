@@ -52,6 +52,7 @@ let imageLoadToken = 0;
 let projectLoadToken = 0;
 let imageLoading = false;
 let exportPreviewController = null;
+let exportPreviewObjectUrl = null;
 const MAX_ANNOTATION_HISTORY = 30;
 let annotationAutosaveTimer = null;
 let saveQueue = Promise.resolve();
@@ -166,6 +167,42 @@ async function apiRequest(url, options = {}) {
     }
     return data;
 }
+
+async function imageRequest(url, options = {}) {
+    const response = await fetch(url, options);
+    if (!response.ok) {
+        let message = `请求失败（HTTP ${response.status}）`;
+        try {
+            const data = await response.json();
+            message = data.error || message;
+        } catch {
+            // 二进制接口的错误仍应由统一 JSON 信封返回。
+        }
+        throw new Error(message);
+    }
+    const contentType = response.headers.get('Content-Type') || '';
+    if (!contentType.startsWith('image/')) {
+        throw new Error('服务未返回预览图片');
+    }
+    let stats = {};
+    const encodedStats = response.headers.get('X-SAM3-Preview-Stats');
+    if (encodedStats) {
+        try {
+            stats = JSON.parse(decodeURIComponent(encodedStats));
+        } catch {
+            throw new Error('预览统计信息格式无效');
+        }
+    }
+    return { blob: await response.blob(), stats };
+}
+
+function releaseExportPreviewObjectUrl() {
+    if (exportPreviewObjectUrl) {
+        URL.revokeObjectURL(exportPreviewObjectUrl);
+        exportPreviewObjectUrl = null;
+    }
+}
+
 function applyAccessibleButtonNames(root = document) {
     root.querySelectorAll('button[title]:not([aria-label])').forEach(button => {
         if (!button.textContent.trim()) {
@@ -176,6 +213,12 @@ function applyAccessibleButtonNames(root = document) {
 function cancelPreviewRequests() {
     exportPreviewController?.abort();
     exportPreviewController = null;
+    releaseExportPreviewObjectUrl();
+    const previewImage = document.getElementById('exportPreviewImage');
+    if (previewImage) {
+        previewImage.removeAttribute('src');
+        previewImage.style.display = 'none';
+    }
 }
 
 
@@ -2618,7 +2661,7 @@ async function generateExportPreview() {
     }
 
     try {
-        const data = await apiRequest('/api/export/preview', {
+        const data = await imageRequest('/api/export/preview', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             signal: controller.signal,
@@ -2636,7 +2679,9 @@ async function generateExportPreview() {
             || projectId !== state.projectId
             || imageIndex !== state.currentIndex
         ) return;
-        previewImage.src = data.preview;
+        releaseExportPreviewObjectUrl();
+        exportPreviewObjectUrl = URL.createObjectURL(data.blob);
+        previewImage.src = exportPreviewObjectUrl;
         previewImage.style.display = 'block';
         if (placeholder) placeholder.style.display = 'none';
 
@@ -2728,16 +2773,6 @@ function initImageViewerEvents() {
         };
     }
 
-    // 对比预览图
-    const compareImgs = document.querySelectorAll('.compare-img');
-    compareImgs.forEach(img => {
-        img.onclick = function() {
-            if (this.src) {
-                const levelName = this.id.replace('compare', '');
-                openImageViewer(this.src, `平滑级别: ${levelName}`);
-            }
-        };
-    });
 }
 
 // ESC 键关闭查看器

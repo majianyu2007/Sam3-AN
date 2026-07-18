@@ -14,6 +14,10 @@ from functools import wraps
 
 logger = logging.getLogger(__name__)
 
+MAX_VIDEO_SESSIONS = 4
+MAX_VIDEO_PROMPT_POINTS = 1000
+MAX_VIDEO_TEXT_LENGTH = 500
+
 # 使用本地 SAM_src 目录
 sam3_src = Path(__file__).parent.parent / "SAM_src"
 sys.path.insert(0, str(sam3_src))
@@ -639,6 +643,10 @@ class SAM3Service:
 
     @_serialized_inference
     def start_video_session(self, video_path: str) -> str:
+        if len(self.video_sessions) >= MAX_VIDEO_SESSIONS:
+            raise ValueError(
+                f"视频会话不能超过 {MAX_VIDEO_SESSIONS} 个，请先关闭已有会话"
+            )
         self._init_video_model()
         response = self.video_predictor.handle_request(
             request=dict(type="start_session", resource_path=video_path)
@@ -662,6 +670,10 @@ class SAM3Service:
             text = str(prompt_data or '').strip()
             if not text:
                 raise ValueError("文本提示不能为空")
+            if len(text) > MAX_VIDEO_TEXT_LENGTH:
+                raise ValueError(
+                    f"文本提示不能超过 {MAX_VIDEO_TEXT_LENGTH} 个字符"
+                )
             request['text'] = text
         elif prompt_type == 'points':
             if not isinstance(prompt_data, dict):
@@ -673,12 +685,37 @@ class SAM3Service:
                 or not isinstance(labels, list)
                 or not points
                 or len(points) != len(labels)
+                or len(points) > MAX_VIDEO_PROMPT_POINTS
+                or any(
+                    not isinstance(point, list)
+                    or len(point) != 2
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not np.isfinite(value)
+                        for value in point
+                    )
+                    for point in points
+                )
+                or any(
+                    isinstance(label, bool)
+                    or not isinstance(label, int)
+                    or label not in (0, 1)
+                    for label in labels
+                )
             ):
                 raise ValueError("点击提示的 points 和 labels 无效")
             request['points'] = torch.tensor(points, dtype=torch.float32)
             request['point_labels'] = torch.tensor(labels, dtype=torch.int32)
             if 'obj_id' in prompt_data:
-                request['obj_id'] = prompt_data['obj_id']
+                obj_id = prompt_data['obj_id']
+                if (
+                    isinstance(obj_id, bool)
+                    or not isinstance(obj_id, int)
+                    or obj_id < 0
+                ):
+                    raise ValueError("视频对象 ID 无效")
+                request['obj_id'] = obj_id
         else:
             raise ValueError(f"不支持的视频提示类型: {prompt_type}")
         response = self.video_predictor.handle_request(request=request)

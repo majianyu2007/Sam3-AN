@@ -1906,37 +1906,6 @@ body {
     object-fit: contain;
 }
 
-/* 平滑级别对比模态框 */
-#smoothCompareModal .modal-body {
-    background: rgba(0, 0, 0, 0.3);
-}
-
-#smoothCompareGrid {
-    display: flex;
-    gap: 10px;
-}
-
-#smoothCompareGrid .col {
-    flex: 1;
-    min-width: 0;
-}
-
-#smoothCompareGrid h6 {
-    color: var(--primary);
-    margin-bottom: 8px;
-    font-weight: 600;
-}
-
-.compare-img {
-    border: 2px solid rgba(252, 238, 10, 0.3);
-    transition: var(--transition);
-    cursor: pointer;
-}
-
-.compare-img:hover {
-    border-color: var(--primary);
-    box-shadow: 0 0 15px var(--primary-glow);
-}
 
 #exportPreviewStats {
     padding: 8px;
@@ -2048,14 +2017,12 @@ body {
 }
 
 /* 预览图可点击样式 */
-#exportPreviewImage,
-.compare-img {
+#exportPreviewImage {
     cursor: zoom-in;
     transition: var(--transition);
 }
 
-#exportPreviewImage:hover,
-.compare-img:hover {
+#exportPreviewImage:hover {
     opacity: 0.9;
     box-shadow: 0 0 20px var(--primary-glow);
 }

@@ -12,7 +12,7 @@ import atexit
 import re
 import shutil
 import math
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 # 添加SAM3到路径 (使用本地 SAM_src 目录)
 sam3_src = Path(__file__).parent / "SAM_src"
@@ -44,6 +44,10 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024
 app.config['ACCESS_TOKEN'] = None
 app.config['ACCESS_TOKEN_COOKIE'] = 'sam3_access_token'
+app.config['ENABLE_EXPERIMENTAL_VIDEO'] = (
+    os.environ.get('SAM3_ENABLE_EXPERIMENTAL_VIDEO', '').strip().lower()
+    in {'1', 'true', 'yes'}
+)
 app.config['UPLOAD_FOLDER'] = Path(__file__).parent / 'uploads'
 app.config['UPLOAD_FOLDER'].mkdir(exist_ok=True)
 
@@ -165,6 +169,13 @@ def _finite_number(value, field_name) -> float:
     if not math.isfinite(number):
         raise ValueError(f"{field_name}必须是有限数字")
     return number
+
+def normalize_video_session_id(raw_session_id) -> str:
+    session_id = str(raw_session_id or "").strip()
+    if not session_id or len(session_id) > 200:
+        raise ValueError("视频会话 ID 无效")
+    return session_id
+
 
 
 def normalize_prompt_points(raw_points) -> list:
@@ -320,6 +331,24 @@ def handle_request_too_large(_error):
     return error_response("请求体不能超过 32 MiB", 413)
 
 
+def jpeg_response(buffer, stats: dict, *, status=200):
+    """返回二进制 JPEG；小型统计信息放在百分号编码响应头中。"""
+    response = app.response_class(
+        buffer.tobytes(),
+        status=status,
+        mimetype="image/jpeg",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-SAM3-Preview-Stats"] = quote(
+        json.dumps(
+            stats,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        safe="",
+    )
+    return response
+
 def _tokens_match(left, right) -> bool:
     return bool(left and right) and hmac.compare_digest(str(left), str(right))
 
@@ -350,6 +379,15 @@ def enforce_request_security():
             access_token,
         ):
             return error_response('未授权访问', 401)
+
+    if (
+        request.path == '/video' or request.path.startswith('/api/video/')
+    ) and not app.config.get('ENABLE_EXPERIMENTAL_VIDEO'):
+        return error_response(
+            '实验性视频工作流未启用；设置 SAM3_ENABLE_EXPERIMENTAL_VIDEO=1 '
+            '后重启服务',
+            404,
+        )
 
     if request.method not in {'GET', 'HEAD', 'OPTIONS'}:
         if request.headers.get('Sec-Fetch-Site') == 'cross-site':
@@ -961,8 +999,7 @@ def export_coco():
 
 @app.route('/api/export/preview', methods=['POST'])
 def export_preview():
-    """生成导出预览图片，显示平滑后的分割覆盖效果。"""
-    import base64
+    """生成二进制 JPEG 导出预览，显示平滑后的分割覆盖效果。"""
     import cv2
     import numpy as np
 
@@ -1068,20 +1105,16 @@ def export_preview():
         )
         if not encoded:
             raise RuntimeError("预览图片编码失败")
-        return jsonify({
-            "success": True,
-            "preview": (
-                "data:image/jpeg;base64,"
-                + base64.b64encode(buffer).decode("ascii")
-            ),
-            "stats": {
+        return jpeg_response(
+            buffer,
+            {
                 "total_annotations": len(img_info.get("annotations", [])),
                 "rendered_annotations": len(rendered),
                 "smooth_level": smooth_level,
                 "image_size": [image.shape[1], image.shape[0]],
                 "filename": img_info.get("filename", ""),
             },
-        })
+        )
     except (FileNotFoundError, ValueError) as error:
         return error_response(error)
     except Exception as error:
@@ -1089,91 +1122,6 @@ def export_preview():
 
 
 
-@app.route('/api/export/preview_compare', methods=['POST'])
-def export_preview_compare():
-    """生成多个平滑级别的对比预览。"""
-    import base64
-    import cv2
-    import numpy as np
-
-    try:
-        data = json_body()
-        project_id = data.get("project_id")
-        project = annotation_manager.get_project_manifest(project_id)
-        if not project:
-            return error_response("项目不存在", 404)
-        image_index = data.get("image_index", 0)
-        annotation_index = data.get("annotation_index", 0)
-        if any(
-            isinstance(index, bool) or not isinstance(index, int)
-            for index in (image_index, annotation_index)
-        ):
-            raise ValueError("图片和标注索引必须是整数")
-        images = project.get("images", [])
-        if image_index < 0 or image_index >= len(images):
-            raise ValueError("图片索引超出范围")
-        img_info = annotation_manager.get_project_image(
-            project_id,
-            image_index,
-        )
-        annotations = img_info.get("annotations", [])
-        if annotation_index < 0 or annotation_index >= len(annotations):
-            raise ValueError("标注索引超出范围")
-        image_path = resolve_allowed_image(img_info.get("path"))
-        original_image = cv2.imread(str(image_path))
-        if original_image is None:
-            raise ValueError("无法读取图片")
-        exporter = YOLOExporter()
-        polygon = exporter.clamp_polygon(
-            annotations[annotation_index].get("polygon", []),
-            original_image.shape[1],
-            original_image.shape[0],
-        )
-        if len(polygon) < 3:
-            raise ValueError("标注没有有效的多边形数据")
-        previews = {}
-        for level in ("none", "low", "medium", "high", "ultra"):
-            smoothed = exporter.smooth_polygon(polygon, level)
-            if len(smoothed) < 3:
-                raise ValueError(f"{level} 平滑结果不是有效多边形")
-            points = np.asarray(smoothed, dtype=np.int32)
-            image = original_image.copy()
-            overlay = image.copy()
-            cv2.fillPoly(overlay, [points], (0, 255, 0))
-            image = cv2.addWeighted(overlay, 0.4, image, 0.6, 0)
-            cv2.polylines(image, [points], True, (0, 255, 0), 2)
-            cv2.putText(
-                image,
-                f"{level} ({len(smoothed)} pts)",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2,
-            )
-            encoded, buffer = cv2.imencode(
-                ".jpg",
-                image,
-                [cv2.IMWRITE_JPEG_QUALITY, 85],
-            )
-            if not encoded:
-                raise RuntimeError(f"{level} 预览图片编码失败")
-            previews[level] = (
-                "data:image/jpeg;base64,"
-                + base64.b64encode(buffer).decode("ascii")
-            )
-        return jsonify({
-            "success": True,
-            "previews": previews,
-            "original_points": len(polygon),
-            "annotation_label": str(
-                annotations[annotation_index].get("class_name", "")
-            ),
-        })
-    except (FileNotFoundError, ValueError) as error:
-        return error_response(error)
-    except Exception as error:
-        return error_response(error, 500)
 
 
 
@@ -1202,19 +1150,19 @@ def video_add_prompt():
     """向视频会话添加提示。"""
     try:
         data = json_body()
-        session_id = str(data.get("session_id") or "").strip()
+        session_id = normalize_video_session_id(data.get("session_id"))
         frame_index = data.get("frame_index", 0)
         if (
-            not session_id
-            or isinstance(frame_index, bool)
+            isinstance(frame_index, bool)
             or not isinstance(frame_index, int)
             or frame_index < 0
+            or frame_index > 10_000_000
         ):
-            raise ValueError("视频会话 ID 或帧索引无效")
+            raise ValueError("视频帧索引无效")
         results = get_sam3_service().add_video_prompt(
             session_id,
             frame_index,
-            str(data.get("prompt_type") or "text"),
+            str(data.get("prompt_type") or "text").strip().lower(),
             data.get("prompt_data"),
         )
         return jsonify({"success": True, "results": results})
@@ -1230,9 +1178,7 @@ def video_propagate():
     """传播视频分割。"""
     try:
         data = json_body()
-        session_id = str(data.get("session_id") or "").strip()
-        if not session_id:
-            raise ValueError("视频会话 ID 不能为空")
+        session_id = normalize_video_session_id(data.get("session_id"))
         results = get_sam3_service().propagate_video(session_id)
         return jsonify({"success": True, "results": results})
     except ValueError as error:
@@ -1247,9 +1193,7 @@ def video_close_session():
     """关闭视频会话。"""
     try:
         data = json_body()
-        session_id = str(data.get("session_id") or "").strip()
-        if not session_id:
-            raise ValueError("视频会话 ID 不能为空")
+        session_id = normalize_video_session_id(data.get("session_id"))
         get_sam3_service().close_video_session(session_id)
         return jsonify({"success": True})
     except ValueError as error:

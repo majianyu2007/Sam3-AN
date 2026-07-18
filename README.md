@@ -41,11 +41,14 @@
 - 兼容 OpenAI API 格式（DeepSeek、通义千问、Moonshot 等）
 - 可配置 API 地址、密钥和模型
 
-### 🎬 视频标注（视频标注暂不支持！！！）
+### 🎬 视频标注（实验功能，默认关闭）
 
-- 文本提示跟踪
-- 点击提示跟踪
-- 全视频传播分割结果
+视频会话、文本/点击提示和传播接口可用于实验验证；帧读取、播放和导出界面仍是
+占位实现，不可用于生产标注。仅在明确需要测试时启动：
+
+```bash
+SAM3_ENABLE_EXPERIMENTAL_VIDEO=1 uv run python app.py
+```
 
 ### 📦 数据导出
 
@@ -57,6 +60,7 @@
 自动按 8:1:1 比例分割 train/val/test 数据集。
 导出先在同文件系统的暂存目录完整生成，成功后再替换对应格式的旧文件；
 重复导出不会混入上一次遗留的图片或标签，失败时保留上一次完整结果。
+导出预览直接传输 JPEG 并在浏览器中以 Blob URL 显示，避免大图 Base64 拷贝。
 
 ## 🚀 快速开始
 
@@ -110,6 +114,9 @@ uv run python app.py
 
 # 如果 MPS 出现兼容问题，可强制使用 CPU
 SAM3_DEVICE=cpu uv run python app.py
+
+# 仅验证未完成的视频会话工作流
+SAM3_ENABLE_EXPERIMENTAL_VIDEO=1 uv run python app.py
 ```
 
 启动后自动打开浏览器。默认使用 `http://localhost:5000`；如果 macOS AirPlay
