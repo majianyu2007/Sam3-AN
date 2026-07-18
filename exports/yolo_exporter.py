@@ -114,10 +114,15 @@ class YOLOExporter:
 
         return result.tolist()
 
-    def export(self, project: dict, output_dir: str,
-               format_type: str = 'segment',
-               split_ratio: tuple = (0.8, 0.1, 0.1),
-               smooth_level: str = 'medium') -> dict:
+    def export(
+        self,
+        project: dict,
+        output_dir: str,
+        format_type: str = 'segment',
+        split_ratio: tuple = (0.8, 0.1, 0.1),
+        smooth_level: str = 'medium',
+        annotation_loader=None,
+    ) -> dict:
         """以暂存目录生成 YOLO 数据集，成功后替换既有导出。"""
         if format_type not in {'detect', 'segment'}:
             raise ValueError("YOLO 导出类型必须是 detect 或 segment")
@@ -133,14 +138,20 @@ class YOLOExporter:
         self.format_type = format_type
         output_path = Path(output_dir)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        classes = self._resolve_classes(project)
-        class_to_id = {class_name: index for index, class_name in enumerate(classes)}
+        classes = self._resolve_classes(project, annotation_loader)
+        class_to_id = {
+            class_name: index
+            for index, class_name in enumerate(classes)
+        }
         images = [
-            image
-            for image in project.get('images', [])
-            if image.get('annotations')
+            (index, image)
+            for index, image in enumerate(project.get('images', []))
+            if image.get(
+                'annotated',
+                bool(image.get('annotations')),
+            )
         ]
-        stems = [Path(str(image.get('filename', ''))).stem for image in images]
+        stems = [Path(str(image.get('filename', ''))).stem for _, image in images]
         if len(stems) != len(set(stems)):
             raise ValueError("存在同名但扩展名不同的图片，YOLO 标签文件会冲突")
         train_end = int(len(images) * split_ratio[0])
@@ -161,9 +172,14 @@ class YOLOExporter:
                 (staging_path / 'images' / split).mkdir(parents=True)
                 (staging_path / 'labels' / split).mkdir(parents=True)
             for split_name, split_images in splits.items():
-                for image in split_images:
+                for image_index, image in split_images:
                     annotation_count = self._export_image(
                         image,
+                        self._annotations_for(
+                            image,
+                            image_index,
+                            annotation_loader,
+                        ),
                         staging_path,
                         split_name,
                         class_to_id,
@@ -183,7 +199,7 @@ class YOLOExporter:
         stats['output_dir'] = str(output_path)
         return stats
 
-    def _resolve_classes(self, project: dict) -> list:
+    def _resolve_classes(self, project: dict, annotation_loader=None) -> list:
         """保留项目类别顺序，并补入仍被标注引用的类别。"""
         classes = []
         seen = set()
@@ -192,8 +208,17 @@ class YOLOExporter:
             if class_name and class_name not in seen:
                 seen.add(class_name)
                 classes.append(class_name)
-        for image in project.get('images', []):
-            for annotation in image.get('annotations', []):
+        for image_index, image in enumerate(project.get('images', [])):
+            if not image.get(
+                'annotated',
+                bool(image.get('annotations')),
+            ):
+                continue
+            for annotation in self._annotations_for(
+                image,
+                image_index,
+                annotation_loader,
+            ):
                 class_name = str(
                     annotation.get('class_name')
                     or annotation.get('label')
@@ -203,6 +228,19 @@ class YOLOExporter:
                     seen.add(class_name)
                     classes.append(class_name)
         return classes
+
+    @staticmethod
+    def _annotations_for(
+        image: dict,
+        image_index: int,
+        annotation_loader,
+    ) -> list:
+        if annotation_loader is None:
+            return image.get('annotations', [])
+        annotations = annotation_loader(image_index)
+        if not isinstance(annotations, list):
+            raise ValueError("标注加载器必须返回数组")
+        return annotations
 
     @staticmethod
     def clamp_polygon(polygon: list, image_width: int, image_height: int) -> list:
@@ -225,8 +263,9 @@ class YOLOExporter:
             ])
         return points
 
-    def _export_image(self, img_info: dict, output_path: Path,
-                      split: str, class_to_id: dict) -> int:
+    def _export_image(self, img_info: dict, annotations: list,
+                      output_path: Path, split: str,
+                      class_to_id: dict) -> int:
         """导出一张至少含一个有效标签的图片。"""
         src_path = img_info.get('path')
         if not src_path or not os.path.isfile(src_path):
@@ -241,7 +280,7 @@ class YOLOExporter:
             return 0
 
         lines = []
-        for annotation in img_info.get('annotations', []):
+        for annotation in annotations:
             class_name = str(
                 annotation.get('class_name')
                 or annotation.get('label')

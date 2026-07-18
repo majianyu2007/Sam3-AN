@@ -92,10 +92,15 @@ class COCOExporter:
 
         return result.tolist()
 
-    def export(self, project: dict, output_dir: str,
-               export_type: str = 'segment',
-               split_ratio: tuple = (0.8, 0.1, 0.1),
-               smooth_level: str = 'medium') -> dict:
+    def export(
+        self,
+        project: dict,
+        output_dir: str,
+        export_type: str = 'segment',
+        split_ratio: tuple = (0.8, 0.1, 0.1),
+        smooth_level: str = 'medium',
+        annotation_loader=None,
+    ) -> dict:
         """以暂存目录生成 COCO 数据集，成功后替换既有导出。"""
         if export_type not in {'detect', 'segment'}:
             raise ValueError("COCO 导出类型必须是 detect 或 segment")
@@ -111,13 +116,16 @@ class COCOExporter:
         self.export_type = export_type
         output_path = Path(output_dir)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        classes = self._resolve_classes(project)
+        classes = self._resolve_classes(project, annotation_loader)
         images = [
-            image
-            for image in project.get('images', [])
-            if image.get('annotations')
+            (index, image)
+            for index, image in enumerate(project.get('images', []))
+            if image.get(
+                'annotated',
+                bool(image.get('annotations')),
+            )
         ]
-        filenames = [str(image.get('filename') or '') for image in images]
+        filenames = [str(image.get('filename') or '') for _, image in images]
         if len(filenames) != len(set(filenames)):
             raise ValueError("项目中存在重复图片文件名")
         train_end = int(len(images) * split_ratio[0])
@@ -147,6 +155,7 @@ class COCOExporter:
                     coco_data,
                     classes,
                     export_type,
+                    annotation_loader,
                 )
                 with (
                     annotations_path / f'instances_{split_name}.json'
@@ -160,7 +169,7 @@ class COCOExporter:
         stats['output_dir'] = str(output_path)
         return stats
 
-    def _resolve_classes(self, project: dict) -> list:
+    def _resolve_classes(self, project: dict, annotation_loader=None) -> list:
         """保留项目类别顺序，并补入仍被标注引用的类别。"""
         classes = []
         seen = set()
@@ -169,8 +178,17 @@ class COCOExporter:
             if class_name and class_name not in seen:
                 seen.add(class_name)
                 classes.append(class_name)
-        for image in project.get('images', []):
-            for annotation in image.get('annotations', []):
+        for image_index, image in enumerate(project.get('images', [])):
+            if not image.get(
+                'annotated',
+                bool(image.get('annotations')),
+            ):
+                continue
+            for annotation in self._annotations_for(
+                image,
+                image_index,
+                annotation_loader,
+            ):
                 class_name = str(
                     annotation.get('class_name')
                     or annotation.get('label')
@@ -180,6 +198,19 @@ class COCOExporter:
                     seen.add(class_name)
                     classes.append(class_name)
         return classes
+
+    @staticmethod
+    def _annotations_for(
+        image: dict,
+        image_index: int,
+        annotation_loader,
+    ) -> list:
+        if annotation_loader is None:
+            return image.get('annotations', [])
+        annotations = annotation_loader(image_index)
+        if not isinstance(annotations, list):
+            raise ValueError("标注加载器必须返回数组")
+        return annotations
 
     def _create_coco_structure(self, project: dict, classes: list) -> dict:
         """创建COCO基础结构"""
@@ -226,9 +257,16 @@ class COCOExporter:
             ])
         return points
 
-    def _export_split(self, images: list, output_path: Path,
-                      split: str, coco_data: dict, classes: list,
-                      export_type: str = 'segment') -> tuple[int, int]:
+    def _export_split(
+        self,
+        images: list,
+        output_path: Path,
+        split: str,
+        coco_data: dict,
+        classes: list,
+        export_type: str = 'segment',
+        annotation_loader=None,
+    ) -> tuple[int, int]:
         """导出单个数据集分割，并返回实际图片和标注数量。"""
         class_to_id = {
             class_name: index + 1
@@ -238,7 +276,7 @@ class COCOExporter:
         exported_images = 0
         total_annotations = 0
 
-        for img_info in images:
+        for image_index, img_info in images:
             src_path = img_info.get('path')
             if not src_path or not os.path.isfile(src_path):
                 continue
@@ -261,7 +299,12 @@ class COCOExporter:
             })
             exported_images += 1
 
-            for annotation in img_info.get('annotations', []):
+            annotations = self._annotations_for(
+                img_info,
+                image_index,
+                annotation_loader,
+            )
+            for annotation in annotations:
                 class_name = str(
                     annotation.get('class_name')
                     or annotation.get('label')

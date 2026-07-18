@@ -729,7 +729,7 @@ def batch_segment():
     try:
         data = json_body()
         project_id = data.get('project_id')
-        project = annotation_manager.get_project(project_id)
+        project = annotation_manager.get_project_manifest(project_id)
         if not project:
             return error_response('项目不存在', 404)
         prompt = str(data.get('prompt', '')).strip()
@@ -899,7 +899,8 @@ def export_yolo():
     """导出 YOLO 数据集。"""
     try:
         data = json_body()
-        project = annotation_manager.get_project(data.get('project_id'))
+        project_id = data.get('project_id')
+        project = annotation_manager.get_project_manifest(project_id)
         if not project:
             return error_response('项目不存在', 404)
         output_dir = normalize_directory(
@@ -913,6 +914,9 @@ def export_yolo():
             output_dir,
             format_type=data.get('export_type', 'segment'),
             smooth_level=data.get('smooth_level', 'medium'),
+            annotation_loader=lambda image_index: (
+                annotation_manager.get_annotations(project_id, image_index)
+            ),
         )
         return jsonify({'success': True, 'result': result})
     except ValueError as error:
@@ -926,7 +930,8 @@ def export_coco():
     """导出 COCO 数据集。"""
     try:
         data = json_body()
-        project = annotation_manager.get_project(data.get('project_id'))
+        project_id = data.get('project_id')
+        project = annotation_manager.get_project_manifest(project_id)
         if not project:
             return error_response('项目不存在', 404)
         output_dir = normalize_directory(
@@ -940,6 +945,9 @@ def export_coco():
             output_dir,
             export_type=data.get('export_type', 'segment'),
             smooth_level=data.get('smooth_level', 'medium'),
+            annotation_loader=lambda image_index: (
+                annotation_manager.get_annotations(project_id, image_index)
+            ),
         )
         return jsonify({'success': True, 'result': result})
     except ValueError as error:
@@ -959,7 +967,8 @@ def export_preview():
 
     try:
         data = json_body()
-        project = annotation_manager.get_project(data.get("project_id"))
+        project_id = data.get("project_id")
+        project = annotation_manager.get_project_manifest(project_id)
         if not project:
             return error_response("项目不存在", 404)
         image_index = data.get("image_index", 0)
@@ -977,7 +986,10 @@ def export_preview():
         if not 0 <= opacity <= 1:
             raise ValueError("透明度必须在 0 到 1 之间")
 
-        img_info = images[image_index]
+        img_info = annotation_manager.get_project_image(
+            project_id,
+            image_index,
+        )
         image_path = resolve_allowed_image(img_info.get("path"))
         image = cv2.imread(str(image_path))
         if image is None:
@@ -1085,7 +1097,8 @@ def export_preview_compare():
 
     try:
         data = json_body()
-        project = annotation_manager.get_project(data.get("project_id"))
+        project_id = data.get("project_id")
+        project = annotation_manager.get_project_manifest(project_id)
         if not project:
             return error_response("项目不存在", 404)
         image_index = data.get("image_index", 0)
@@ -1098,7 +1111,10 @@ def export_preview_compare():
         images = project.get("images", [])
         if image_index < 0 or image_index >= len(images):
             raise ValueError("图片索引超出范围")
-        img_info = images[image_index]
+        img_info = annotation_manager.get_project_image(
+            project_id,
+            image_index,
+        )
         annotations = img_info.get("annotations", [])
         if annotation_index < 0 or annotation_index >= len(annotations):
             raise ValueError("标注索引超出范围")

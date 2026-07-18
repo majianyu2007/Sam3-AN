@@ -173,6 +173,88 @@ class AnnotationManagerTests(unittest.TestCase):
             parsed = json.loads((data_dir / "projects.json").read_text())
             self.assertEqual(parsed["projects"][0]["id"], "project1")
 
+    def test_current_sidecars_are_loaded_on_demand_with_bounded_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = AnnotationManager(
+                temp_dir,
+                start_autosave=False,
+                annotation_cache_size=2,
+            )
+            manager.create_project({
+                "id": "project1",
+                "name": "懒加载项目",
+                "images": [
+                    {
+                        "filename": f"{index}.jpg",
+                        "annotations": [{"id": f"a{index}"}],
+                    }
+                    for index in range(3)
+                ],
+                "classes": [],
+            })
+            self.assertTrue(all(
+                "annotations" not in image
+                for image in manager.projects["project1"]["images"]
+            ))
+            manager.shutdown()
+
+            sidecar_reads = []
+            original_reader = AnnotationManager._read_json_file
+
+            def tracked_reader(path):
+                if path.parent.name == "image_annotations":
+                    sidecar_reads.append(path.name)
+                return original_reader(path)
+
+            with patch.object(
+                AnnotationManager,
+                "_read_json_file",
+                new=staticmethod(tracked_reader),
+            ):
+                reloaded = AnnotationManager(
+                    temp_dir,
+                    start_autosave=False,
+                    annotation_cache_size=2,
+                )
+                self.assertEqual(sidecar_reads, [])
+                for index in range(3):
+                    self.assertEqual(
+                        reloaded.get_annotations("project1", index)[0]["id"],
+                        f"a{index}",
+                    )
+                self.assertEqual(len(sidecar_reads), 3)
+                self.assertEqual(len(reloaded._annotation_cache), 2)
+                self.assertTrue(all(
+                    "annotations" not in image
+                    for image in reloaded.projects["project1"]["images"]
+                ))
+
+    def test_clearing_annotations_removes_primary_and_backup_sidecars(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = AnnotationManager(temp_dir, start_autosave=False)
+            manager.create_project({
+                "id": "project1",
+                "name": "清空标注",
+                "images": [{"filename": "one.jpg", "annotations": []}],
+                "classes": [],
+            })
+            manager.save_annotations("project1", 0, [{"id": "first"}])
+            manager.save_annotations("project1", 0, [{"id": "second"}])
+            sidecar = manager._image_sidecar_path("project1", "one.jpg")
+            self.assertTrue(sidecar.is_file())
+            self.assertTrue(sidecar.with_suffix(".json.bak").is_file())
+
+            manager.save_annotations("project1", 0, [])
+            self.assertFalse(sidecar.exists())
+            self.assertFalse(sidecar.with_suffix(".json.bak").exists())
+            reloaded = AnnotationManager(temp_dir, start_autosave=False)
+            self.assertEqual(reloaded.get_annotations("project1", 0), [])
+            self.assertFalse(
+                reloaded.get_project_manifest("project1")["images"][0][
+                    "annotated"
+                ]
+            )
+
     def test_negative_and_out_of_range_indices_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = AnnotationManager(temp_dir, start_autosave=False)
@@ -549,6 +631,47 @@ class ExporterContractTests(unittest.TestCase):
         ]
         self.assertEqual(exported[0]["area"], 50.0)
         self.assertEqual(result["classes"], ["configured", "legacy"])
+
+    def test_exporters_load_annotations_from_manifest_on_demand(self):
+        source_records = [
+            self.image_record("one.png"),
+            self.image_record("two.png"),
+        ]
+        manifest = {
+            "id": "project1",
+            "name": "dataset",
+            "classes": ["configured"],
+            "images": [
+                {
+                    key: value
+                    for key, value in image.items()
+                    if key != "annotations"
+                }
+                for image in source_records
+            ],
+        }
+
+        for exporter, output_name in (
+            (YOLOExporter(), "stream-yolo"),
+            (COCOExporter(), "stream-coco"),
+        ):
+            calls = []
+
+            def load_annotations(image_index):
+                calls.append(image_index)
+                return source_records[image_index]["annotations"]
+
+            exporter.export(
+                manifest,
+                str(self.root / output_name),
+                smooth_level="none",
+                annotation_loader=load_annotations,
+            )
+            self.assertEqual(set(calls), {0, 1})
+            self.assertTrue(all(
+                "annotations" not in image
+                for image in manifest["images"]
+            ))
 
 
 class ServiceConcurrencyTests(unittest.TestCase):

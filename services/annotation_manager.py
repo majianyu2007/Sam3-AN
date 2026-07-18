@@ -4,6 +4,7 @@
 """
 
 import copy
+from collections import OrderedDict
 import hashlib
 import os
 import shutil
@@ -23,6 +24,7 @@ class AnnotationManager:
         data_dir: str | Path | None = None,
         autosave_interval: float = 60,
         start_autosave: bool = True,
+        annotation_cache_size: int = 16,
     ):
         if data_dir is None:
             data_dir = Path(__file__).parent.parent / "data"
@@ -36,6 +38,8 @@ class AnnotationManager:
         self._closed = False
         self._sidecars_ready = set()
         self._registry_dirty = False
+        self._annotation_cache_size = max(1, int(annotation_cache_size))
+        self._annotation_cache = OrderedDict()
         self.thread = None
         self._load_all_projects()
 
@@ -161,7 +165,10 @@ class AnnotationManager:
             project.setdefault("classes", [])
             project.pop("image_count", None)
             project.pop("annotated_count", None)
-            if self._overlay_image_sidecars(project):
+            if self._overlay_sidecar_presence(
+                project,
+                preserve_legacy=detail_schema < 3,
+            ):
                 self._registry_dirty = True
             if detail_schema >= 3:
                 self._sidecars_ready.add(project_id)
@@ -183,42 +190,44 @@ class AnnotationManager:
             / self._image_sidecar_name(filename)
         )
 
-    def _overlay_image_sidecars(self, project: dict) -> bool:
+    def _overlay_sidecar_presence(
+        self,
+        project: dict,
+        *,
+        preserve_legacy: bool,
+    ) -> bool:
+        """仅按 sidecar 文件名恢复 annotated 状态，不解析标注正文。"""
         sidecar_dir = self.data_dir / project["id"] / "image_annotations"
-        if not sidecar_dir.is_dir():
-            return False
-        sidecars = {}
-        latest_update = project.get("updated_at", "")
-        for path in sidecar_dir.iterdir():
-            if (
-                path.suffix != ".json"
-                or ".corrupt-" in path.name
-                or not path.is_file()
-            ):
-                continue
-            payload = self._load_json_with_recovery(path, {})
-            filename = payload.get("filename")
-            annotations = payload.get("annotations")
-            if isinstance(filename, str) and isinstance(annotations, list):
-                sidecars[filename] = payload
-                latest_update = max(
-                    latest_update,
-                    payload.get("updated_at", ""),
+        sidecar_names = set()
+        if sidecar_dir.is_dir():
+            sidecar_names = {
+                path.name
+                for path in sidecar_dir.iterdir()
+                if (
+                    path.suffix == ".json"
+                    and ".corrupt-" not in path.name
+                    and path.is_file()
                 )
+            }
+
+        changed = False
         for image in project.get("images", []):
-            payload = sidecars.get(image.get("filename"))
-            if payload is None:
-                image.setdefault("annotations", [])
-                image["annotated"] = bool(image.get("annotations"))
-                continue
-            image["annotations"] = payload["annotations"]
-            image["annotated"] = bool(
-                payload.get("annotated", payload["annotations"])
+            legacy_annotations = image.get("annotations")
+            has_sidecar = (
+                self._image_sidecar_name(str(image.get("filename", "")))
+                in sidecar_names
             )
-        if latest_update > project.get("updated_at", ""):
-            project["updated_at"] = latest_update
-            return True
-        return False
+            annotated = has_sidecar or (
+                preserve_legacy
+                and isinstance(legacy_annotations, list)
+                and bool(legacy_annotations)
+            )
+            if bool(image.get("annotated")) != annotated:
+                changed = True
+            image["annotated"] = annotated
+            if not preserve_legacy:
+                image.pop("annotations", None)
+        return changed
 
     def autosave_loop(self):
         """等待一个周期后再保存；启动时不立即覆盖刚读取的数据。"""
@@ -260,33 +269,106 @@ class AnnotationManager:
             )
             self._registry_dirty = False
 
-    def _save_image_annotations(self, project_id: str, image: dict):
+    @staticmethod
+    def _annotation_cache_key(project_id: str, filename: str) -> tuple:
+        return project_id, filename
+
+    def _cache_annotations(
+        self,
+        project_id: str,
+        filename: str,
+        annotations: list,
+    ) -> list:
+        key = self._annotation_cache_key(project_id, filename)
+        self._annotation_cache[key] = annotations
+        self._annotation_cache.move_to_end(key)
+        while len(self._annotation_cache) > self._annotation_cache_size:
+            self._annotation_cache.popitem(last=False)
+        return annotations
+
+    def _load_image_annotations(
+        self,
+        project_id: str,
+        image: dict,
+    ) -> list:
+        filename = image.get("filename")
+        if not filename:
+            raise ValueError("图片缺少文件名，无法读取标注")
+        key = self._annotation_cache_key(project_id, filename)
+        if key in self._annotation_cache:
+            self._annotation_cache.move_to_end(key)
+            return self._annotation_cache[key]
+
+        legacy_annotations = image.get("annotations")
+        if isinstance(legacy_annotations, list):
+            annotations = copy.deepcopy(legacy_annotations)
+        else:
+            payload = self._load_json_with_recovery(
+                self._image_sidecar_path(project_id, filename),
+                {},
+            )
+            if (
+                payload.get("project_id") == project_id
+                and payload.get("filename") == filename
+                and isinstance(payload.get("annotations"), list)
+            ):
+                annotations = payload["annotations"]
+            else:
+                annotations = []
+
+        if bool(image.get("annotated")) != bool(annotations):
+            image["annotated"] = bool(annotations)
+            self._registry_dirty = True
+        return self._cache_annotations(project_id, filename, annotations)
+
+    def _save_image_annotations(
+        self,
+        project_id: str,
+        image: dict,
+        annotations: list,
+    ):
         filename = image.get("filename")
         if not filename:
             raise ValueError("图片缺少文件名，无法保存标注")
         project = self._require_project(project_id)
-        self._atomic_write_json(
-            self._image_sidecar_path(project_id, filename),
-            {
-                "schema_version": 3,
-                "project_id": project_id,
-                "filename": filename,
-                "annotated": bool(image.get("annotated", False)),
-                "annotations": image.get("annotations", []),
-                "updated_at": project.get(
-                    "updated_at",
-                    datetime.now().isoformat(),
-                ),
-            },
-        )
+        annotations = copy.deepcopy(annotations)
+        sidecar_path = self._image_sidecar_path(project_id, filename)
+        if annotations:
+            self._atomic_write_json(
+                sidecar_path,
+                {
+                    "schema_version": 3,
+                    "project_id": project_id,
+                    "filename": filename,
+                    "annotated": True,
+                    "annotations": annotations,
+                    "updated_at": project.get(
+                        "updated_at",
+                        datetime.now().isoformat(),
+                    ),
+                },
+            )
+        else:
+            sidecar_path.unlink(missing_ok=True)
+            sidecar_path.with_suffix(sidecar_path.suffix + ".bak").unlink(
+                missing_ok=True,
+            )
+        image.pop("annotations", None)
+        image["annotated"] = bool(annotations)
+        self._cache_annotations(project_id, filename, annotations)
 
     def _save_all_image_annotations(self, project_id: str):
         project = self.projects.get(project_id)
         if not project:
             return
         for image in project.get("images", []):
-            if image.get("annotations") or image.get("annotated"):
-                self._save_image_annotations(project_id, image)
+            annotations = image.get("annotations")
+            if isinstance(annotations, list):
+                self._save_image_annotations(
+                    project_id,
+                    image,
+                    annotations,
+                )
 
     def _save_project_annotations(self, project_id: str):
         with self._lock:
@@ -295,20 +377,14 @@ class AnnotationManager:
                 return
             if project_id not in self._sidecars_ready:
                 self._save_all_image_annotations(project_id)
-            images = [
-                {
-                    key: value
-                    for key, value in image.items()
-                    if key != "annotations"
-                }
-                for image in project.get("images", [])
-            ]
+            for image in project.get("images", []):
+                image.pop("annotations", None)
             self._atomic_write_json(
                 self.data_dir / project_id / "annotations.json",
                 {
                     "schema_version": 3,
                     "project_id": project_id,
-                    "images": images,
+                    "images": project.get("images", []),
                     "classes": project.get("classes", []),
                     "updated_at": project.get(
                         "updated_at",
@@ -322,13 +398,13 @@ class AnnotationManager:
         """同步未落盘的轻量元数据，并完成旧格式的一次性迁移。"""
         with self._lock:
             saved = False
-            if self._registry_dirty:
-                self._save_all_projects()
-                saved = True
             for project_id in list(self.projects):
                 if project_id not in self._sidecars_ready:
                     self._save_project_annotations(project_id)
                     saved = True
+            if self._registry_dirty:
+                self._save_all_projects()
+                saved = True
             return saved
 
     def shutdown(self):
@@ -374,9 +450,9 @@ class AnnotationManager:
             project.setdefault("classes", [])
             self.projects[project_id] = project
             (self.data_dir / project_id).mkdir(parents=True, exist_ok=True)
-            self._save_all_projects()
             self._save_project_annotations(project_id)
-            return copy.deepcopy(project)
+            self._save_all_projects()
+            return self._hydrate_project(project)
 
     @staticmethod
     def _project_manifest(project: dict) -> dict:
@@ -396,19 +472,31 @@ class AnnotationManager:
         ]
         return manifest
 
+    def _hydrate_project(self, project: dict) -> dict:
+        hydrated = copy.deepcopy(self._project_manifest(project))
+        for index, image in enumerate(project.get("images", [])):
+            hydrated["images"][index]["annotations"] = copy.deepcopy(
+                self._load_image_annotations(project["id"], image)
+            )
+        return hydrated
+
     def get_project_manifest(self, project_id: str) -> dict | None:
         with self._lock:
             project = self.projects.get(project_id)
             return copy.deepcopy(self._project_manifest(project)) if project else None
 
     def get_project(self, project_id: str) -> dict | None:
+        """兼容完整项目读取；标注逐图加载且不驻留在项目 manifest。"""
         with self._lock:
             project = self.projects.get(project_id)
-            return copy.deepcopy(project) if project else None
+            return self._hydrate_project(project) if project else None
 
     def list_projects(self) -> list:
         with self._lock:
-            return copy.deepcopy(list(self.projects.values()))
+            return [
+                self._hydrate_project(project)
+                for project in self.projects.values()
+            ]
     def list_project_summaries(self) -> list:
         """返回不含图片和标注大数组的轻量项目列表。"""
         with self._lock:
@@ -437,27 +525,50 @@ class AnnotationManager:
             project_dir = self.data_dir / project_id
             if project_dir.exists():
                 shutil.rmtree(project_dir)
+            stale_keys = [
+                key for key in self._annotation_cache
+                if key[0] == project_id
+            ]
+            for key in stale_keys:
+                self._annotation_cache.pop(key, None)
 
     def update_project_images(self, project_id: str, images: list, image_dir: str):
         with self._lock:
             project = self._require_project(project_id)
-            existing_annotations = {
-                image["filename"]: copy.deepcopy(image.get("annotations", []))
+            if project_id not in self._sidecars_ready:
+                self._save_project_annotations(project_id)
+            existing_annotated = {
+                image.get("filename")
                 for image in project.get("images", [])
-                if image.get("annotations")
+                if image.get("annotated")
             }
             images = copy.deepcopy(images)
+            new_annotations = []
             for image in images:
-                annotations = existing_annotations.get(image["filename"])
-                if annotations:
-                    image["annotations"] = annotations
-                    image["annotated"] = True
+                filename = image.get("filename")
+                if not filename:
+                    raise ValueError("图片缺少文件名")
+                annotations = image.pop("annotations", [])
+                has_existing = (
+                    filename in existing_annotated
+                    or self._image_sidecar_path(project_id, filename).is_file()
+                )
+                image["annotated"] = has_existing or bool(annotations)
+                if annotations and not has_existing:
+                    new_annotations.append((image, annotations))
             project["images"] = images
             project["image_dir"] = image_dir
             project["current_index"] = min(
-                project.get("current_index", 0), max(len(images) - 1, 0)
+                project.get("current_index", 0),
+                max(len(images) - 1, 0),
             )
             project["updated_at"] = datetime.now().isoformat()
+            for image, annotations in new_annotations:
+                self._save_image_annotations(
+                    project_id,
+                    image,
+                    annotations,
+                )
             self._save_all_projects()
             self._save_project_annotations(project_id)
 
@@ -471,33 +582,51 @@ class AnnotationManager:
         with self._lock:
             project = self._require_project(project_id)
             image = self._require_image(project, image_index)
-            annotations = copy.deepcopy(annotations)
-            for annotation in annotations:
+            combined = copy.deepcopy(
+                self._load_image_annotations(project_id, image)
+            )
+            additions = copy.deepcopy(annotations)
+            for annotation in additions:
                 if label:
                     annotation["class_name"] = label
                 annotation.setdefault("id", str(uuid.uuid4())[:8])
-            image.setdefault("annotations", []).extend(annotations)
-            image["annotated"] = bool(image["annotations"])
+            combined.extend(additions)
             project["updated_at"] = datetime.now().isoformat()
-            self._save_image_annotations(project_id, image)
+            self._save_image_annotations(project_id, image, combined)
             self._registry_dirty = True
 
     def save_annotations(self, project_id: str, image_index: int, annotations: list):
         with self._lock:
             project = self._require_project(project_id)
             image = self._require_image(project, image_index)
-            image["annotations"] = copy.deepcopy(annotations)
-            image["annotated"] = bool(annotations)
             project["current_index"] = image_index
             project["updated_at"] = datetime.now().isoformat()
-            self._save_image_annotations(project_id, image)
+            self._save_image_annotations(project_id, image, annotations)
             self._registry_dirty = True
 
     def get_annotations(self, project_id: str, image_index: int) -> list:
         with self._lock:
             project = self._require_project(project_id)
             image = self._require_image(project, image_index)
-            return copy.deepcopy(image.get("annotations", []))
+            return copy.deepcopy(
+                self._load_image_annotations(project_id, image)
+            )
+    def get_project_image(
+        self,
+        project_id: str,
+        image_index: int,
+        *,
+        include_annotations: bool = True,
+    ) -> dict:
+        with self._lock:
+            project = self._require_project(project_id)
+            image = self._require_image(project, image_index)
+            result = copy.deepcopy(image)
+            if include_annotations:
+                result["annotations"] = copy.deepcopy(
+                    self._load_image_annotations(project_id, image)
+                )
+            return result
 
     def update_annotation(
         self,
@@ -509,10 +638,13 @@ class AnnotationManager:
         with self._lock:
             project = self._require_project(project_id)
             image = self._require_image(project, image_index)
+            annotations = copy.deepcopy(
+                self._load_image_annotations(project_id, image)
+            )
             annotation = next(
                 (
                     item
-                    for item in image.get("annotations", [])
+                    for item in annotations
                     if item.get("id") == annotation_id
                 ),
                 None,
@@ -521,21 +653,22 @@ class AnnotationManager:
                 raise ValueError(f"标注不存在: {annotation_id}")
             annotation.update(copy.deepcopy(updates))
             project["updated_at"] = datetime.now().isoformat()
-            self._save_image_annotations(project_id, image)
+            self._save_image_annotations(project_id, image, annotations)
             self._registry_dirty = True
 
     def delete_annotation(self, project_id: str, image_index: int, annotation_id: str):
         with self._lock:
             project = self._require_project(project_id)
             image = self._require_image(project, image_index)
-            annotations = image.get("annotations", [])
-            remaining = [item for item in annotations if item.get("id") != annotation_id]
+            annotations = self._load_image_annotations(project_id, image)
+            remaining = [
+                item for item in annotations
+                if item.get("id") != annotation_id
+            ]
             if len(remaining) == len(annotations):
                 raise ValueError(f"标注不存在: {annotation_id}")
-            image["annotations"] = remaining
-            image["annotated"] = bool(remaining)
             project["updated_at"] = datetime.now().isoformat()
-            self._save_image_annotations(project_id, image)
+            self._save_image_annotations(project_id, image, remaining)
             self._registry_dirty = True
 
     def update_classes(self, project_id: str, classes: list):
@@ -555,9 +688,13 @@ class AnnotationManager:
         with self._lock:
             project = self._require_project(project_id)
             image = self._require_image(project, image_index)
-            image["annotated"] = annotated
+            annotations = self._load_image_annotations(project_id, image)
+            if annotated and not annotations:
+                raise ValueError("空标注图片不能标记为已标注")
+            if not annotated:
+                annotations = []
             project["updated_at"] = datetime.now().isoformat()
-            self._save_image_annotations(project_id, image)
+            self._save_image_annotations(project_id, image, annotations)
             self._registry_dirty = True
 
     def get_annotation_stats(self, project_id: str) -> dict:
@@ -567,7 +704,8 @@ class AnnotationManager:
             total = len(images)
             annotated = sum(1 for image in images if image.get("annotated", False))
             total_annotations = sum(
-                len(image.get("annotations", [])) for image in images
+                len(self._load_image_annotations(project_id, image))
+                for image in images
             )
             return {
                 "total_images": total,
