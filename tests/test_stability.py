@@ -440,7 +440,7 @@ class FlaskContractTests(unittest.TestCase):
             },
         )
         self.assertEqual(invalid_geometry.status_code, 400)
-        self.assertIn("有限数字", invalid_geometry.get_json()["error"])
+        self.assertIn("bbox必须是数字", invalid_geometry.get_json()["error"])
 
         too_many = self.client.post(
             "/api/annotation/save",

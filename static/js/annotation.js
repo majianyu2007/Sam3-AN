@@ -8,6 +8,7 @@ const state = {
     imageDir: '',
     outputDir: '',
     images: [],
+    annotatedCount: 0,
     currentIndex: 0,
     annotations: [],
     classes: [],
@@ -29,7 +30,9 @@ const state = {
     dirty: false,
     revision: 0,
     history: [],
-    historyIndex: -1
+    historyIndex: -1,
+    historyWeights: [],
+    historyWeight: 0,
 };
 
 // Canvas相关
@@ -47,6 +50,11 @@ let imageFilterQuery = '';
 let filteredImageIndices = [];
 let renderedImages = null;
 let imageListRafId = null;
+let filteredImagesSource = null;
+let filteredImagesQuery = null;
+const ANNOTATION_ROW_HEIGHT = 62;
+let annotationListRafId = null;
+let renderedAnnotationImageKey = null;
 let imageSearchTimer = null;
 let imageLoadToken = 0;
 let projectLoadToken = 0;
@@ -54,10 +62,31 @@ let imageLoading = false;
 let exportPreviewController = null;
 let exportPreviewObjectUrl = null;
 const MAX_ANNOTATION_HISTORY = 30;
+const MAX_ANNOTATION_HISTORY_WEIGHT = 500000;
 let annotationAutosaveTimer = null;
 let saveQueue = Promise.resolve();
 let lastQueuedSave = null;
 let batchCancelRequested = false;
+
+function replaceImages(images) {
+    state.images = Array.isArray(images) ? images : [];
+    state.annotatedCount = state.images.reduce(
+        (count, image) => count + (image.annotated ? 1 : 0),
+        0
+    );
+    filteredImagesSource = null;
+    renderedImages = null;
+}
+
+function setImageAnnotated(index, annotated) {
+    const image = state.images[index];
+    if (!image) return;
+    const nextValue = Boolean(annotated);
+    if (Boolean(image.annotated) !== nextValue) {
+        state.annotatedCount += nextValue ? 1 : -1;
+        image.annotated = nextValue;
+    }
+}
 
 function cancelBatch() {
     batchCancelRequested = true;
@@ -82,9 +111,7 @@ function updateSaveIndicator(status, message) {
 }
 
 function renderAnnotationState() {
-    if (state.images[state.currentIndex]) {
-        state.images[state.currentIndex].annotated = state.annotations.length > 0;
-    }
+    setImageAnnotated(state.currentIndex, state.annotations.length > 0);
     state.selectedAnnotation = null;
     invalidateStaticCache();
     updateAnnotationList();
@@ -92,9 +119,23 @@ function renderAnnotationState() {
     redraw();
 }
 
+function annotationHistoryWeight(annotations) {
+    let weight = annotations.length * 8;
+    for (const annotation of annotations) {
+        weight += Array.isArray(annotation.polygon)
+            ? annotation.polygon.length
+            : 0;
+    }
+    return weight;
+}
+
 function resetAnnotationHistory() {
     state.revision++;
-    state.history = [structuredClone(state.annotations)];
+    const snapshot = structuredClone(state.annotations);
+    const weight = annotationHistoryWeight(snapshot);
+    state.history = [snapshot];
+    state.historyWeights = [weight];
+    state.historyWeight = weight;
     state.historyIndex = 0;
     state.dirty = false;
     updateSaveIndicator('saved');
@@ -103,10 +144,26 @@ function resetAnnotationHistory() {
 
 function recordAnnotationMutation({ autosave = true } = {}) {
     state.revision++;
+    const discardedWeights = state.historyWeights.splice(state.historyIndex + 1);
+    state.historyWeight -= discardedWeights.reduce(
+        (total, weight) => total + weight,
+        0
+    );
     state.history.splice(state.historyIndex + 1);
-    state.history.push(structuredClone(state.annotations));
-    if (state.history.length > MAX_ANNOTATION_HISTORY) {
+    const snapshot = structuredClone(state.annotations);
+    const weight = annotationHistoryWeight(snapshot);
+    state.history.push(snapshot);
+    state.historyWeights.push(weight);
+    state.historyWeight += weight;
+    while (
+        state.history.length > 2
+        && (
+            state.history.length > MAX_ANNOTATION_HISTORY
+            || state.historyWeight > MAX_ANNOTATION_HISTORY_WEIGHT
+        )
+    ) {
         state.history.shift();
+        state.historyWeight -= state.historyWeights.shift();
     }
     state.historyIndex = state.history.length - 1;
     state.dirty = true;
@@ -415,7 +472,7 @@ async function rescanProjectImages({ notify = false } = {}) {
                 body: JSON.stringify({ image_dir: data.project.image_dir })
             }
         );
-        state.images = scanData.images;
+        replaceImages(scanData.images);
         updateImageList();
         if (notify) {
             showToast('扫描完成', `找到 ${scanData.count} 张图片`);
@@ -507,6 +564,25 @@ function initEventListeners() {
     imageList.addEventListener('click', event => {
         const item = event.target.closest('.image-item');
         if (item) loadImage(Number(item.dataset.imageIndex));
+    });
+
+    const annotationList = document.getElementById('annotationList');
+    annotationList.addEventListener('scroll', () => {
+        if (annotationListRafId) return;
+        annotationListRafId = requestAnimationFrame(() => {
+            renderAnnotationListWindow();
+            annotationListRafId = null;
+        });
+    });
+    annotationList.addEventListener('click', event => {
+        const item = event.target.closest('.annotation-item');
+        if (!item) return;
+        const id = item.dataset.annotationId;
+        if (event.target.closest('.delete-annotation')) {
+            deleteAnnotation(id);
+        } else {
+            selectAnnotation(id);
+        }
     });
 
     // 文本提示回车
@@ -1721,9 +1797,9 @@ async function batchSegment() {
                             annotations
                         })
                     });
-                    state.images[imageIndex].annotated = true;
+                    setImageAnnotated(imageIndex, true);
                     if (imageIndex === state.currentIndex) {
-                        state.annotations = structuredClone(annotations);
+                        state.annotations = annotations;
                     }
                 }
                 totalDetections += newResults.length;
@@ -1922,7 +1998,7 @@ async function deleteProject(projectId, projectName) {
             state.projectId = null;
             state.imageDir = '';
             state.outputDir = '';
-            state.images = [];
+            replaceImages([]);
             state.annotations = [];
             state.classes = [];
             state.currentClass = null;
@@ -2063,9 +2139,9 @@ async function selectProject(projectId) {
         state.imageDir = project.image_dir || '';
         state.outputDir = project.output_dir || '';
         state.classes = project.classes || [];
-        state.images = images;
+        replaceImages(images);
         state.currentIndex = currentIndex;
-        state.annotations = structuredClone(loadedAnnotations);
+        state.annotations = loadedAnnotations;
         state.tempPoints = [];
         state.tempBoxes = [];
         state.tempPolygon = [];
@@ -2119,7 +2195,7 @@ async function loadProjectImages(imageDir = state.imageDir) {
             }
         );
         state.imageDir = data.image_dir;
-        state.images = data.images;
+        replaceImages(data.images);
         updateImageList();
         if (state.images.length > 0) {
             if (!(await loadImage(0))) return false;
@@ -2165,16 +2241,18 @@ function renderImageListWindow() {
             </div>
         `;
     }).join('');
+    const scrollTop = list.scrollTop;
     list.innerHTML = `
         <div class="image-list-spacer" style="height:${start * IMAGE_ROW_HEIGHT}px"></div>
         ${rows}
         <div class="image-list-spacer" style="height:${(filteredImageIndices.length - end) * IMAGE_ROW_HEIGHT}px"></div>
     `;
+    list.scrollTop = scrollTop;
 }
 
 function updateImageList({ scrollCurrent = false } = {}) {
     const list = document.getElementById('imageList');
-    const annotatedCount = state.images.filter(image => image.annotated).length;
+    const annotatedCount = state.annotatedCount;
     const total = state.images.length;
     const percent = total > 0 ? Math.round(annotatedCount / total * 100) : 0;
     document.getElementById('imageStats').textContent = `${annotatedCount}/${total}`;
@@ -2190,15 +2268,24 @@ function updateImageList({ scrollCurrent = false } = {}) {
         renderedImages = state.images;
         list.scrollTop = 0;
     }
-    filteredImageIndices = [];
-    for (let index = 0; index < state.images.length; index++) {
-        if (state.images[index].filename.toLowerCase().includes(imageFilterQuery)) {
-            filteredImageIndices.push(index);
+    if (
+        filteredImagesSource !== state.images
+        || filteredImagesQuery !== imageFilterQuery
+    ) {
+        filteredImageIndices = [];
+        for (let index = 0; index < state.images.length; index++) {
+            if (state.images[index].filename.toLowerCase().includes(imageFilterQuery)) {
+                filteredImageIndices.push(index);
+            }
         }
+        filteredImagesSource = state.images;
+        filteredImagesQuery = imageFilterQuery;
     }
 
     if (scrollCurrent) {
-        const position = filteredImageIndices.indexOf(state.currentIndex);
+        const position = imageFilterQuery
+            ? filteredImageIndices.indexOf(state.currentIndex)
+            : state.currentIndex;
         if (position >= 0) {
             const rowTop = position * IMAGE_ROW_HEIGHT;
             const rowBottom = rowTop + IMAGE_ROW_HEIGHT;
@@ -2281,7 +2368,7 @@ async function loadImage(index) {
         if (loadToken !== imageLoadToken) return false;
 
         state.currentIndex = index;
-        state.annotations = structuredClone(annotations);
+        state.annotations = annotations;
         if (previousIndex !== index && state.images[previousIndex]) {
             delete state.images[previousIndex].annotations;
         }
@@ -2332,15 +2419,50 @@ function nextImage() {
 
 // ==================== 标注管理 ====================
 
-function updateAnnotationList() {
+function renderAnnotationListWindow({ scrollSelected = false } = {}) {
     const list = document.getElementById('annotationList');
     if (state.annotations.length === 0) {
         list.innerHTML = '<div class="text-muted small p-2">暂无标注</div>';
         return;
     }
-    list.innerHTML = state.annotations.map((annotation, index) => {
+
+    const imageKey = `${state.projectId || ''}:${state.currentIndex}`;
+    if (renderedAnnotationImageKey !== imageKey) {
+        renderedAnnotationImageKey = imageKey;
+        list.scrollTop = 0;
+    }
+    if (scrollSelected && state.selectedAnnotation) {
+        const selectedIndex = state.annotations.findIndex(
+            annotation => annotation.id === state.selectedAnnotation
+        );
+        if (selectedIndex >= 0) {
+            const rowTop = selectedIndex * ANNOTATION_ROW_HEIGHT;
+            const rowBottom = rowTop + ANNOTATION_ROW_HEIGHT;
+            if (
+                rowTop < list.scrollTop
+                || rowBottom > list.scrollTop + list.clientHeight
+            ) {
+                list.scrollTop = Math.max(0, rowTop - ANNOTATION_ROW_HEIGHT);
+            }
+        }
+    }
+
+    const viewportHeight = list.clientHeight || 250;
+    const overscan = 5;
+    const start = Math.max(
+        0,
+        Math.floor(list.scrollTop / ANNOTATION_ROW_HEIGHT) - overscan
+    );
+    const visibleCount = Math.ceil(
+        viewportHeight / ANNOTATION_ROW_HEIGHT
+    ) + overscan * 2;
+    const end = Math.min(state.annotations.length, start + visibleCount);
+    const rows = state.annotations.slice(start, end).map((annotation, offset) => {
+        const index = start + offset;
         const id = escapeHtml(annotation.id);
-        const label = escapeHtml(annotation.class_name || annotation.label || 'obj');
+        const label = escapeHtml(
+            annotation.class_name || annotation.label || 'obj'
+        );
         const score = Number(annotation.score) || 0;
         return `
             <div class="annotation-item ${state.selectedAnnotation === annotation.id ? 'selected' : ''}"
@@ -2358,20 +2480,23 @@ function updateAnnotationList() {
             </div>
         `;
     }).join('');
+    const scrollTop = list.scrollTop;
+    list.innerHTML = `
+        <div style="height:${start * ANNOTATION_ROW_HEIGHT}px"></div>
+        ${rows}
+        <div style="height:${(state.annotations.length - end) * ANNOTATION_ROW_HEIGHT}px"></div>
+    `;
+    list.scrollTop = scrollTop;
     applyAccessibleButtonNames(list);
-    list.querySelectorAll('.annotation-item').forEach(item => {
-        const id = item.dataset.annotationId;
-        item.addEventListener('click', () => selectAnnotation(id));
-        item.querySelector('.delete-annotation').addEventListener('click', event => {
-            event.stopPropagation();
-            deleteAnnotation(id);
-        });
-    });
+}
+
+function updateAnnotationList(options = {}) {
+    renderAnnotationListWindow(options);
 }
 
 function selectAnnotation(id) {
     state.selectedAnnotation = state.selectedAnnotation === id ? null : id;
-    updateAnnotationList();
+    updateAnnotationList({ scrollSelected: true });
     redraw();
 }
 
@@ -2430,7 +2555,12 @@ async function saveAnnotations(showMessage = true) {
     const projectId = state.projectId;
     const imageIndex = state.currentIndex;
     const revision = state.revision;
-    const annotations = structuredClone(state.annotations);
+    const annotationCount = state.annotations.length;
+    const payload = JSON.stringify({
+        project_id: projectId,
+        image_index: imageIndex,
+        annotations: state.annotations
+    });
     const saveKey = `${projectId}:${imageIndex}:${revision}`;
     if (lastQueuedSave?.key === saveKey) {
         return lastQueuedSave.promise;
@@ -2442,15 +2572,10 @@ async function saveAnnotations(showMessage = true) {
             await apiRequest('/api/annotation/save', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    project_id: projectId,
-                    image_index: imageIndex,
-                    annotations
-                })
+                body: payload
             });
             if (state.projectId === projectId && state.images[imageIndex]) {
-                state.images[imageIndex].annotations = structuredClone(annotations);
-                state.images[imageIndex].annotated = annotations.length > 0;
+                setImageAnnotated(imageIndex, annotationCount > 0);
                 updateImageList();
             }
             if (

@@ -3,16 +3,20 @@ COCO格式导出器
 支持标准COCO实例分割格式
 """
 import os
-import json
+import orjson
 import shutil
 import tempfile
 import math
 from pathlib import Path
 from datetime import datetime
-from PIL import Image, ImageOps
 import numpy as np
 import cv2
-from exports.export_utils import bbox_polygon, clamp_bbox, deterministic_splits
+from exports.export_utils import (
+    bbox_polygon,
+    clamp_bbox,
+    deterministic_splits,
+    oriented_image_size,
+)
 
 
 class COCOExporter:
@@ -164,10 +168,11 @@ class COCOExporter:
                     export_type,
                     annotation_loader,
                 )
-                with (
+                (
                     annotations_path / f'instances_{split_name}.json'
-                ).open('w', encoding='utf-8') as file:
-                    json.dump(coco_data, file, ensure_ascii=False, indent=2)
+                ).write_bytes(
+                    orjson.dumps(coco_data, option=orjson.OPT_INDENT_2)
+                )
                 stats[split_name] = image_count
                 stats['total_annotations'] += annotation_count
                 stats['converted_bbox_annotations'] += converted_count
@@ -293,9 +298,7 @@ class COCOExporter:
             filename = str(img_info.get('filename') or '')
             if not filename or Path(filename).name != filename:
                 raise ValueError(f"图片文件名无效: {filename!r}")
-            with Image.open(src_path) as source:
-                image = ImageOps.exif_transpose(source)
-                image_width, image_height = image.size
+            image_width, image_height = oriented_image_size(src_path)
             if image_width <= 0 or image_height <= 0:
                 continue
             image_id = exported_images + 1

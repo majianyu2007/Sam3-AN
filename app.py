@@ -27,18 +27,39 @@ from flask import (
     send_file,
     send_from_directory,
 )
+from flask.json.provider import JSONProvider
 from werkzeug.exceptions import RequestEntityTooLarge
 import json
 import uuid
 import requests
 from datetime import datetime
+import orjson
 
 from services.sam3_service import SAM3Service, _select_device
 from services.annotation_manager import AnnotationManager
 from exports.yolo_exporter import YOLOExporter
 from exports.coco_exporter import COCOExporter
 
+class OrjsonProvider(JSONProvider):
+    """直接返回 orjson 字节，避免大型 manifest 的标准库编码与 UTF-8 复制。"""
+    mimetype = "application/json"
+
+    def dumps(self, obj, **_kwargs):
+        return orjson.dumps(obj).decode("utf-8")
+
+    def loads(self, value, **_kwargs):
+        return orjson.loads(value)
+
+    def response(self, *args, **kwargs):
+        obj = self._prepare_response_obj(args, kwargs)
+        return self._app.response_class(
+            orjson.dumps(obj) + b"\n",
+            mimetype=self.mimetype,
+        )
+
+
 app = Flask(__name__)
+app.json = OrjsonProvider(app)
 
 # 本地工具默认不接受跨站请求；显式 LAN 模式通过访问令牌保护。
 app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024

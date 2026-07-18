@@ -1004,6 +1004,8 @@ body {
     transition: var(--transition);
     position: relative;
     overflow: hidden;
+    height: 56px;
+    box-sizing: border-box;
 }
 
 .annotation-item::before {

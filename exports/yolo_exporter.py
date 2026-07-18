@@ -3,11 +3,15 @@ import shutil
 import tempfile
 import math
 from pathlib import Path
-from PIL import Image, ImageOps
 import yaml
 import numpy as np
 import cv2
-from exports.export_utils import bbox_polygon, clamp_bbox, deterministic_splits
+from exports.export_utils import (
+    bbox_polygon,
+    clamp_bbox,
+    deterministic_splits,
+    oriented_image_size,
+)
 
 
 class YOLOExporter:
@@ -139,11 +143,13 @@ class YOLOExporter:
         self.format_type = format_type
         output_path = Path(output_dir)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        classes = self._resolve_classes(project, annotation_loader)
-        class_to_id = {
-            class_name: index
-            for index, class_name in enumerate(classes)
-        }
+        classes = []
+        class_to_id = {}
+        for raw_class_name in project.get('classes', []):
+            class_name = str(raw_class_name).strip()
+            if class_name and class_name not in class_to_id:
+                class_to_id[class_name] = len(classes)
+                classes.append(class_name)
         images = [
             (index, image)
             for index, image in enumerate(project.get('images', []))
@@ -195,6 +201,7 @@ class YOLOExporter:
                         stats[split_name] += 1
                         stats['total_annotations'] += annotation_count
                         stats['converted_bbox_annotations'] += converted_count
+            classes = list(class_to_id)
             self._generate_yaml(
                 staging_path,
                 classes,
@@ -208,35 +215,6 @@ class YOLOExporter:
         stats['split_seed'] = split_seed
         return stats
 
-    def _resolve_classes(self, project: dict, annotation_loader=None) -> list:
-        """保留项目类别顺序，并补入仍被标注引用的类别。"""
-        classes = []
-        seen = set()
-        for class_name in project.get('classes', []):
-            class_name = str(class_name).strip()
-            if class_name and class_name not in seen:
-                seen.add(class_name)
-                classes.append(class_name)
-        for image_index, image in enumerate(project.get('images', [])):
-            if not image.get(
-                'annotated',
-                bool(image.get('annotations')),
-            ):
-                continue
-            for annotation in self._annotations_for(
-                image,
-                image_index,
-                annotation_loader,
-            ):
-                class_name = str(
-                    annotation.get('class_name')
-                    or annotation.get('label')
-                    or 'object'
-                ).strip()
-                if class_name and class_name not in seen:
-                    seen.add(class_name)
-                    classes.append(class_name)
-        return classes
 
     @staticmethod
     def _annotations_for(
@@ -282,9 +260,7 @@ class YOLOExporter:
         filename = str(img_info.get('filename') or '')
         if not filename or Path(filename).name != filename:
             raise ValueError(f"图片文件名无效: {filename!r}")
-        with Image.open(src_path) as source:
-            image = ImageOps.exif_transpose(source)
-            image_width, image_height = image.size
+        image_width, image_height = oriented_image_size(src_path)
         if image_width <= 0 or image_height <= 0:
             return 0, 0
 
@@ -295,7 +271,9 @@ class YOLOExporter:
                 annotation.get('class_name')
                 or annotation.get('label')
                 or 'object'
-            ).strip()
+            ).strip() or 'object'
+            if class_name not in class_to_id:
+                class_to_id[class_name] = len(class_to_id)
             class_id = class_to_id[class_name]
             if self.format_type == 'segment':
                 polygon = self.clamp_polygon(

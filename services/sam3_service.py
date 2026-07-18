@@ -518,78 +518,31 @@ class SAM3Service:
             logger.exception("框选分割失败")
             raise RuntimeError(f"框选分割失败: {error}") from error
 
-    def _extract_results_with_mask(self, output: dict, label: str, negative_boxes: list) -> list:
-        """从输出提取结果，并使用 mask 级别过滤负样本区域"""
-        results = []
+    @staticmethod
+    def _batch_to_numpy(values):
+        """整批同步设备张量；避免每个结果分别触发 GPU/MPS 同步。"""
+        if torch.is_tensor(values):
+            return values.detach().cpu().numpy()
+        return [
+            value.detach().cpu().numpy()
+            if torch.is_tensor(value)
+            else np.asarray(value)
+            for value in values
+        ]
 
+    def _extract_results_common(
+        self,
+        output: dict,
+        label: str,
+        negative_boxes: list | None = None,
+    ) -> list:
         if output is None:
             logger.debug("模型未返回结果")
-            return results
+            return []
 
-        masks = output.get('masks', [])
-        boxes = output.get('boxes', [])
-        scores = output.get('scores', [])
-
-        logger.debug(
-            "原始结果: masks=%d, boxes=%d, scores=%d",
-            len(masks),
-            len(boxes),
-            len(scores),
-        )
-
-        filtered_count = 0
-        for i, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
-            try:
-                mask_np = mask[0].cpu().numpy()
-                box_np = box.cpu().numpy().tolist()
-
-                # 使用 mask 级别的负样本过滤
-                if negative_boxes and self._mask_in_negative_region(mask_np, negative_boxes, threshold=0.4):
-                    logger.debug(
-                        "结果 %d (score=%.4f) 被负样本区域过滤",
-                        i,
-                        float(score),
-                    )
-                    filtered_count += 1
-                    continue
-
-                logger.debug(
-                    "结果 %d: score=%.4f, bbox=%s",
-                    i,
-                    float(score),
-                    box_np,
-                )
-
-                polygon = self._mask_to_polygon(mask_np)
-
-                results.append({
-                    'id': str(uuid.uuid4())[:8],
-                    'label': label,
-                    'score': float(score),
-                    'bbox': box_np,
-                    'polygon': polygon,
-                    'area': float(mask_np.sum()),
-                })
-            except Exception as e:
-                logger.exception("提取结果 %d 失败", i)
-
-        if filtered_count > 0:
-            logger.debug("负样本过滤结果数: %d", filtered_count)
-
-        return results
-
-    def _extract_results(self, output: dict, label: str) -> list:
-        """从输出提取结果"""
-        results = []
-
-        if output is None:
-            logger.debug("模型未返回结果")
-            return results
-
-        masks = output.get('masks', [])
-        boxes = output.get('boxes', [])
-        scores = output.get('scores', [])
-
+        masks = self._batch_to_numpy(output.get('masks', []))
+        boxes = self._batch_to_numpy(output.get('boxes', []))
+        scores = self._batch_to_numpy(output.get('scores', []))
         logger.debug(
             "结果: masks=%d, boxes=%d, scores=%d",
             len(masks),
@@ -597,32 +550,56 @@ class SAM3Service:
             len(scores),
         )
 
-        for i, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
+        results = []
+        filtered_count = 0
+        for index, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
             try:
-                mask_np = mask[0].cpu().numpy()
-                box_np = box.cpu().numpy().tolist()
-
-                logger.debug(
-                    "结果 %d: score=%.4f, bbox=%s",
-                    i,
-                    float(score),
-                    box_np,
-                )
+                mask_np = np.asarray(mask)
+                if mask_np.ndim == 3 and mask_np.shape[0] == 1:
+                    mask_np = mask_np[0]
+                box_values = np.asarray(box).tolist()
+                score_value = float(np.asarray(score).item())
+                if negative_boxes and self._mask_in_negative_region(
+                    mask_np,
+                    negative_boxes,
+                    threshold=0.4,
+                ):
+                    filtered_count += 1
+                    logger.debug(
+                        "结果 %d (score=%.4f) 被负样本区域过滤",
+                        index,
+                        score_value,
+                    )
+                    continue
 
                 polygon = self._mask_to_polygon(mask_np)
-
                 results.append({
                     'id': str(uuid.uuid4())[:8],
                     'label': label,
-                    'score': float(score),
-                    'bbox': box_np,
+                    'score': score_value,
+                    'bbox': box_values,
                     'polygon': polygon,
                     'area': float(mask_np.sum()),
                 })
-            except Exception as e:
-                logger.exception("提取结果 %d 失败", i)
+            except Exception:
+                logger.exception("提取结果 %d 失败", index)
 
+        if filtered_count:
+            logger.debug("负样本过滤结果数: %d", filtered_count)
         return results
+
+    def _extract_results_with_mask(
+        self,
+        output: dict,
+        label: str,
+        negative_boxes: list,
+    ) -> list:
+        """从输出提取结果，并使用 mask 级别过滤负样本区域。"""
+        return self._extract_results_common(output, label, negative_boxes)
+
+    def _extract_results(self, output: dict, label: str) -> list:
+        """从输出提取结果。"""
+        return self._extract_results_common(output, label)
 
     # ==================== 视频分割 ====================
 

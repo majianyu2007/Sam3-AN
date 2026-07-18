@@ -3,7 +3,6 @@
 负责项目、图片、标注的增删改查与安全持久化。
 """
 
-import copy
 from collections import OrderedDict
 import hashlib
 import os
@@ -14,6 +13,11 @@ from datetime import datetime
 from pathlib import Path
 
 import orjson
+
+def _json_clone(value):
+    """通过已验证的 JSON 表示创建隔离副本，避免递归 Python deepcopy。"""
+    return orjson.loads(orjson.dumps(value))
+
 
 
 class AnnotationManager:
@@ -138,7 +142,7 @@ class AnnotationManager:
         for stored_project in projects:
             if not isinstance(stored_project, dict) or not stored_project.get("id"):
                 continue
-            project = copy.deepcopy(stored_project)
+            project = _json_clone(stored_project)
             project_id = project["id"]
             detail_path = self.data_dir / project_id / "annotations.json"
             detail = self._load_json_with_recovery(detail_path, {})
@@ -301,7 +305,7 @@ class AnnotationManager:
 
         legacy_annotations = image.get("annotations")
         if isinstance(legacy_annotations, list):
-            annotations = copy.deepcopy(legacy_annotations)
+            annotations = _json_clone(legacy_annotations)
         else:
             payload = self._load_json_with_recovery(
                 self._image_sidecar_path(project_id, filename),
@@ -331,7 +335,7 @@ class AnnotationManager:
         if not filename:
             raise ValueError("图片缺少文件名，无法保存标注")
         project = self._require_project(project_id)
-        annotations = copy.deepcopy(annotations)
+        annotations = _json_clone(annotations)
         sidecar_path = self._image_sidecar_path(project_id, filename)
         if annotations:
             self._atomic_write_json(
@@ -439,7 +443,7 @@ class AnnotationManager:
 
     def create_project(self, project: dict) -> dict:
         with self._lock:
-            project = copy.deepcopy(project)
+            project = _json_clone(project)
             project_id = project.get("id", str(uuid.uuid4())[:8])
             if project_id in self.projects:
                 raise ValueError(f"项目已存在: {project_id}")
@@ -473,17 +477,15 @@ class AnnotationManager:
         return manifest
 
     def _hydrate_project(self, project: dict) -> dict:
-        hydrated = copy.deepcopy(self._project_manifest(project))
+        hydrated = _json_clone(self._project_manifest(project))
         for index, image in enumerate(project.get("images", [])):
-            hydrated["images"][index]["annotations"] = copy.deepcopy(
-                self._load_image_annotations(project["id"], image)
-            )
+            hydrated["images"][index]["annotations"] = _json_clone(self._load_image_annotations(project["id"], image))
         return hydrated
 
     def get_project_manifest(self, project_id: str) -> dict | None:
         with self._lock:
             project = self.projects.get(project_id)
-            return copy.deepcopy(self._project_manifest(project)) if project else None
+            return _json_clone(self._project_manifest(project)) if project else None
 
     def get_project(self, project_id: str) -> dict | None:
         """兼容完整项目读取；标注逐图加载且不驻留在项目 manifest。"""
@@ -500,22 +502,20 @@ class AnnotationManager:
     def list_project_summaries(self) -> list:
         """返回不含图片和标注大数组的轻量项目列表。"""
         with self._lock:
-            return copy.deepcopy(
-                [
-                    self._registry_record(project)
-                    for project in self.projects.values()
-                ]
-            )
+            return _json_clone([
+                self._registry_record(project)
+                for project in self.projects.values()
+            ])
 
 
     def update_project(self, project_id: str, updates: dict) -> dict:
         with self._lock:
             project = self._require_project(project_id)
-            project.update(copy.deepcopy(updates))
+            project.update(_json_clone(updates))
             project["updated_at"] = datetime.now().isoformat()
             self._save_all_projects()
             self._save_project_annotations(project_id)
-            return copy.deepcopy(project)
+            return _json_clone(project)
 
     def delete_project(self, project_id: str):
         with self._lock:
@@ -542,7 +542,7 @@ class AnnotationManager:
                 for image in project.get("images", [])
                 if image.get("annotated")
             }
-            images = copy.deepcopy(images)
+            images = _json_clone(images)
             new_annotations = []
             for image in images:
                 filename = image.get("filename")
@@ -582,10 +582,8 @@ class AnnotationManager:
         with self._lock:
             project = self._require_project(project_id)
             image = self._require_image(project, image_index)
-            combined = copy.deepcopy(
-                self._load_image_annotations(project_id, image)
-            )
-            additions = copy.deepcopy(annotations)
+            combined = _json_clone(self._load_image_annotations(project_id, image))
+            additions = _json_clone(annotations)
             for annotation in additions:
                 if label:
                     annotation["class_name"] = label
@@ -608,9 +606,7 @@ class AnnotationManager:
         with self._lock:
             project = self._require_project(project_id)
             image = self._require_image(project, image_index)
-            return copy.deepcopy(
-                self._load_image_annotations(project_id, image)
-            )
+            return _json_clone(self._load_image_annotations(project_id, image))
     def get_project_image(
         self,
         project_id: str,
@@ -621,11 +617,9 @@ class AnnotationManager:
         with self._lock:
             project = self._require_project(project_id)
             image = self._require_image(project, image_index)
-            result = copy.deepcopy(image)
+            result = _json_clone(image)
             if include_annotations:
-                result["annotations"] = copy.deepcopy(
-                    self._load_image_annotations(project_id, image)
-                )
+                result["annotations"] = _json_clone(self._load_image_annotations(project_id, image))
             return result
 
     def update_annotation(
@@ -638,9 +632,7 @@ class AnnotationManager:
         with self._lock:
             project = self._require_project(project_id)
             image = self._require_image(project, image_index)
-            annotations = copy.deepcopy(
-                self._load_image_annotations(project_id, image)
-            )
+            annotations = _json_clone(self._load_image_annotations(project_id, image))
             annotation = next(
                 (
                     item
@@ -651,7 +643,7 @@ class AnnotationManager:
             )
             if annotation is None:
                 raise ValueError(f"标注不存在: {annotation_id}")
-            annotation.update(copy.deepcopy(updates))
+            annotation.update(_json_clone(updates))
             project["updated_at"] = datetime.now().isoformat()
             self._save_image_annotations(project_id, image, annotations)
             self._registry_dirty = True
@@ -674,7 +666,7 @@ class AnnotationManager:
     def update_classes(self, project_id: str, classes: list):
         with self._lock:
             project = self._require_project(project_id)
-            project["classes"] = copy.deepcopy(classes)
+            project["classes"] = _json_clone(classes)
             project["updated_at"] = datetime.now().isoformat()
             self._save_all_projects()
             self._save_project_annotations(project_id)

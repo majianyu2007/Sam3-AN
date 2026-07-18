@@ -3,6 +3,21 @@
 import hashlib
 import math
 import random
+from PIL import Image
+
+
+EXIF_ORIENTATION_TAG = 274
+SWAPPED_ORIENTATIONS = frozenset({5, 6, 7, 8})
+
+
+def oriented_image_size(path) -> tuple[int, int]:
+    """仅读取图片元数据，并按 EXIF 方向返回显示尺寸，不解码完整像素。"""
+    with Image.open(path) as source:
+        width, height = source.size
+        if source.getexif().get(EXIF_ORIENTATION_TAG) in SWAPPED_ORIENTATIONS:
+            return height, width
+        return width, height
+
 
 def clamp_bbox(bbox, image_width: int, image_height: int, filename: str):
     """验证并限制 xyxy 边界框；退化框返回 None。"""
