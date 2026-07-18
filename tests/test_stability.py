@@ -19,7 +19,7 @@ atexit.unregister(app_module.shutdown_services)
 
 
 class AnnotationManagerTests(unittest.TestCase):
-    def test_annotations_are_written_immediately_and_atomically(self):
+    def test_annotations_write_only_the_changed_image_sidecar(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = AnnotationManager(temp_dir, start_autosave=False)
             manager.create_project({
@@ -39,32 +39,115 @@ class AnnotationManagerTests(unittest.TestCase):
                 "class_name": "cat",
                 "bbox": [1, 2, 3, 4],
             }
-            registry_before = (Path(temp_dir) / "projects.json").read_bytes()
+            registry_path = Path(temp_dir) / "projects.json"
+            detail_path = Path(temp_dir) / "project1" / "annotations.json"
+            registry_before = registry_path.read_bytes()
+            detail_before = detail_path.read_bytes()
             manager.save_annotations("project1", 0, [annotation])
 
-            registry_path = Path(temp_dir) / "projects.json"
             registry = json.loads(registry_path.read_text())
-            detail = json.loads(
-                (Path(temp_dir) / "project1" / "annotations.json").read_text()
+            detail = json.loads(detail_path.read_text())
+            sidecars = list(
+                (Path(temp_dir) / "project1" / "image_annotations").glob("*.json")
             )
-            self.assertEqual(registry["schema_version"], 2)
+            self.assertEqual(registry["schema_version"], 3)
             self.assertNotIn("images", registry["projects"][0])
             self.assertEqual(registry["projects"][0]["image_count"], 1)
             self.assertEqual(registry_path.read_bytes(), registry_before)
-            self.assertEqual(
-                detail["images"][0]["annotations"][0]["id"],
-                "annotation1",
-            )
+            self.assertEqual(detail_path.read_bytes(), detail_before)
+            self.assertNotIn("annotations", detail["images"][0])
+            self.assertEqual(len(sidecars), 1)
+            sidecar = json.loads(sidecars[0].read_text())
+            self.assertEqual(sidecar["annotations"][0]["id"], "annotation1")
             self.assertEqual(list(Path(temp_dir).rglob("*.tmp")), [])
-            self.assertTrue(
-                (Path(temp_dir) / "project1" / "annotations.json.bak").is_file()
-            )
 
             reloaded = AnnotationManager(temp_dir, start_autosave=False)
             self.assertEqual(
                 reloaded.get_annotations("project1", 0)[0]["id"],
                 "annotation1",
             )
+            self.assertTrue(reloaded.flush())
+            self.assertFalse(reloaded.flush())
+
+    def test_corrupt_image_sidecar_recovers_from_valid_backup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = AnnotationManager(temp_dir, start_autosave=False)
+            manager.create_project({
+                "id": "project1",
+                "name": "测试项目",
+                "images": [{
+                    "filename": "cat.jpg",
+                    "annotations": [],
+                }],
+                "classes": ["cat"],
+            })
+            manager.save_annotations("project1", 0, [{"id": "first"}])
+            manager.save_annotations("project1", 0, [{"id": "second"}])
+            sidecar = next(
+                (Path(temp_dir) / "project1" / "image_annotations").glob("*.json")
+            )
+            self.assertTrue(sidecar.with_suffix(".json.bak").is_file())
+            sidecar.write_bytes(b"{")
+
+            recovered = AnnotationManager(temp_dir, start_autosave=False)
+            self.assertEqual(
+                recovered.get_annotations("project1", 0),
+                [{"id": "first"}],
+            )
+            self.assertEqual(
+                json.loads(sidecar.read_text())["annotations"],
+                [{"id": "first"}],
+            )
+
+    def test_legacy_detail_migrates_to_sidecars_on_flush(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            project_dir = data_dir / "legacy"
+            project_dir.mkdir()
+            (data_dir / "projects.json").write_text(json.dumps({
+                "schema_version": 2,
+                "projects": [{
+                    "id": "legacy",
+                    "name": "旧项目",
+                    "image_count": 1,
+                    "updated_at": "2026-01-01T00:00:00",
+                }],
+            }))
+            (project_dir / "annotations.json").write_text(json.dumps({
+                "schema_version": 2,
+                "project_id": "legacy",
+                "images": [{
+                    "filename": "cat.jpg",
+                    "annotated": True,
+                    "annotations": [{"id": "legacy-annotation"}],
+                }],
+                "classes": ["cat"],
+                "updated_at": "2026-01-01T00:00:00",
+            }))
+
+            manager = AnnotationManager(data_dir, start_autosave=False)
+            self.assertEqual(
+                manager.get_annotations("legacy", 0)[0]["id"],
+                "legacy-annotation",
+            )
+            self.assertTrue(manager.flush())
+            manifest = json.loads(
+                (project_dir / "annotations.json").read_text()
+            )
+            registry = json.loads((data_dir / "projects.json").read_text())
+            self.assertEqual(manifest["schema_version"], 3)
+            self.assertNotIn("annotations", manifest["images"][0])
+            self.assertEqual(registry["schema_version"], 3)
+            self.assertEqual(
+                len(list((project_dir / "image_annotations").glob("*.json"))),
+                1,
+            )
+            reloaded = AnnotationManager(data_dir, start_autosave=False)
+            self.assertEqual(
+                reloaded.get_annotations("legacy", 0)[0]["id"],
+                "legacy-annotation",
+            )
+
 
     def test_corrupt_registry_recovers_from_valid_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -81,7 +164,10 @@ class AnnotationManagerTests(unittest.TestCase):
             (data_dir / "projects.json").write_bytes(b"")
 
             recovered = AnnotationManager(data_dir, start_autosave=False)
-            self.assertEqual(recovered.get_project("project1")["name"], "原始名称")
+            self.assertEqual(
+                recovered.get_project("project1")["name"],
+                "原始名称",
+            )
             parsed = json.loads((data_dir / "projects.json").read_text())
             self.assertEqual(parsed["projects"][0]["id"], "project1")
 
@@ -98,7 +184,6 @@ class AnnotationManagerTests(unittest.TestCase):
                 manager.save_annotations("project1", -1, [])
             with self.assertRaisesRegex(ValueError, "图片索引越界"):
                 manager.get_annotations("project1", 1)
-
 
 class FlaskContractTests(unittest.TestCase):
     def setUp(self):
@@ -158,7 +243,19 @@ class FlaskContractTests(unittest.TestCase):
         detail = json.loads(
             (self.root / "data" / project["id"] / "annotations.json").read_text()
         )
-        self.assertEqual(detail["images"][0]["annotations"][0]["id"], "a1")
+        self.assertNotIn("annotations", detail["images"][0])
+        sidecar = next(
+            (
+                self.root
+                / "data"
+                / project["id"]
+                / "image_annotations"
+            ).glob("*.json")
+        )
+        self.assertEqual(
+            json.loads(sidecar.read_text())["annotations"][0]["id"],
+            "a1",
+        )
 
         project_list = self.client.get("/api/project/list")
         self.assertEqual(project_list.status_code, 200)

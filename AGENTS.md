@@ -25,7 +25,8 @@ Flask (app.py) — ~30 routes across 12 sections
 services/        exports/
    │                │
    ├─ AnnotationManager  →  data/projects.json + data/<id>/annotations.json
-   │                        (threading.Lock, daemon autosave every 60s, orjson)
+   │                        + data/<id>/image_annotations/<sha256>.json
+   │                        (threading.RLock, dirty-only 60s autosave, orjson)
    └─ SAM3Service  →  SAM_src/sam3 (sys.path.insert at import)
                         build_sam3_image_model(checkpoint_path='sam3.pt')
                         weights: sam3.pt at CWD (HF fallback: facebook/sam3)
@@ -95,10 +96,12 @@ only in its own dev extras — not wired for the app.
   `jsonify({'success': False, 'error': str(e)})` inside a `try/except`. Match this for any new endpoint.
 - **Lazy service loading**: services needing the GPU model go through `get_sam3_service()` (singleton, first-call init).
   Do not import-time initialize SAM3 — it's ~3.2 GB and slow.
-- **Persistence via orjson + `threading.RLock`**: `AnnotationManager` keeps `data/projects.json` as a
-  schema-v2 metadata-only registry; large image/annotation arrays live in `data/<id>/annotations.json`.
-  Annotation mutations write only the project detail file, using fsynced temp files + `os.replace`, valid
-  `.bak` recovery, a delayed 60s autosave, and graceful `shutdown()`.
+- **Persistence via orjson + `threading.RLock`**: `AnnotationManager` uses schema v3:
+  `data/projects.json` is a metadata-only registry, `data/<id>/annotations.json` is the image/class
+  manifest, and each image's annotations live in `data/<id>/image_annotations/<sha256(filename)>.json`.
+  An annotation mutation atomically rewrites only its small image sidecar; dirty registry metadata flushes
+  on the delayed 60s autosave or graceful `shutdown()`. Fsynced temp files, `os.replace`, `.bak` recovery,
+  and automatic schema-v2 migration apply to every layer.
 - **Routing layout**: `app.py` is organized by `# ==================== <Section> API ====================` comment banners
   (Project / Image / SAM3 segment / Annotation / Classes / Export / Export preview / Video / AI translate / App exit).
   Add new routes under the matching banner.
@@ -123,8 +126,11 @@ only in its own dev extras — not wired for the app.
   No settings module — env var `SAM3_DEVICE` (`cuda|mps|cpu`) can override the inference device in `sam3_service.py`.
   AI-translate API config (key/url/model) is stored per-project in `data/`.
 - **Model factory/checkpoint**: `SAM_src/sam3/model_builder.py` defaults to `checkpoint_path='sam3.pt'` at CWD. Verified checkpoint: 3,450,062,241 bytes, SHA-256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`; downloaded from public mirror `1038lab/sam3` because official `facebook/sam3` is gated. `*.pt` is gitignored.
-- **State files**: `data/projects.json` (registry), `data/<project_id>/annotations.json` (per-project annotations).
-  Runtime `.bak`, `.corrupt-*.json`, and temp files are gitignored. Mutations write both registry and project detail immediately; startup recovers from a valid backup and preserves unrecoverable input under a timestamped corrupt filename.
+- **State files**: `data/projects.json` (registry), `data/<project_id>/annotations.json` (image/class manifest),
+  and `data/<project_id>/image_annotations/<sha256(filename)>.json` (per-image annotations).
+  Runtime `.bak`, `.corrupt-*.json`, and temp files are gitignored. Annotation mutations persist their
+  sidecar immediately; startup overlays sidecars onto the manifest, recovers valid backups, and preserves
+  unrecoverable input under timestamped corrupt filenames.
 - **Vendor metadata**: `SAM_src/sam3.egg-info/PKG-INFO` (sam3 v0.1.0, requires-python >=3.8).
 
 ## Runtime / Tooling Preferences
@@ -139,16 +145,16 @@ only in its own dev extras — not wired for the app.
 
 ## Testing & QA
 
-- **Project stability suite**: `tests/test_stability.py` uses stdlib `unittest` for compact registry/detail
-  persistence, atomic recovery, lightweight project-list contracts, route envelopes/path validation, singleton
-  concurrency, and inference-error propagation. Run:
+- **Project stability suite**: `tests/test_stability.py` uses stdlib `unittest` for schema-v2 migration,
+  per-image sidecar writes/recovery, lightweight project-list contracts, route envelopes/path validation,
+  singleton concurrency, and inference-error propagation. Run:
   `uv run python -m unittest discover -s tests -p 'test_stability.py' -v`.
 - **Vendor tests**: `SAM_src/sam3/perflib/tests/tests.py` contains the upstream `TestMasksToBoxes`; a standalone
   `test_reindex_function()` exists in `SAM_src/sam3/eval/coco_reindex.py`.
 - **No CI config** (no `.github/`, no `tox.ini`, no `pytest.ini`).
-- **Verification practice**: smoke-test changes by running `python app.py` and exercising the affected
-  `/api/*` route through the browser UI or a `curl` POST. Confirm the response envelope and that
-  `data/projects.json` / per-project annotation files update as expected.
+- **Verification practice**: smoke-test changes by running `uv run python app.py` and exercising the affected
+  `/api/*` route through the browser UI or a `curl` POST. Confirm the response envelope and that the registry,
+  project manifest, and affected per-image sidecar update as expected.
 - **Verified macOS path (Apple M5)**: strict MPS text/point/box inference passes. Current browser smoke test created
   a POSIX-path project, scanned and loaded the first image, rejected a legacy Windows path visibly, restored state after reload, returned one real cat detection through `/api/segment/text`, and confirmed the saved annotation through `/api/annotation/get`.
 - **Coverage**: not measured. Treat Flask route contracts, browser workflows, and `AnnotationManager` persistence as load-bearing verification surfaces.
