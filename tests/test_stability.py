@@ -200,12 +200,17 @@ class FlaskContractTests(unittest.TestCase):
         )
         self.original_manager = app_module.annotation_manager
         app_module.annotation_manager = self.manager
+        self.original_access_token = app_module.app.config.get("ACCESS_TOKEN")
+        self.original_content_limit = app_module.app.config["MAX_CONTENT_LENGTH"]
+        app_module.app.config["ACCESS_TOKEN"] = None
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
 
     def tearDown(self):
         self.manager.shutdown()
         app_module.annotation_manager = self.original_manager
+        app_module.app.config["ACCESS_TOKEN"] = self.original_access_token
+        app_module.app.config["MAX_CONTENT_LENGTH"] = self.original_content_limit
         self.temp_dir.cleanup()
 
     def create_project(self):
@@ -288,6 +293,78 @@ class FlaskContractTests(unittest.TestCase):
         )
         self.assertEqual(invalid.status_code, 400)
         self.assertFalse(invalid.get_json()["success"])
+
+    def test_annotation_payload_limits_and_geometry_validation(self):
+        project = self.create_project()
+        self.client.post(
+            f"/api/project/{project['id']}/load_images",
+            json={"image_dir": str(self.images_dir)},
+        )
+        invalid_geometry = self.client.post(
+            "/api/annotation/save",
+            json={
+                "project_id": project["id"],
+                "image_index": 0,
+                "annotations": [{
+                    "id": "bad",
+                    "bbox": [0, 0, float("inf"), 10],
+                }],
+            },
+        )
+        self.assertEqual(invalid_geometry.status_code, 400)
+        self.assertIn("有限数字", invalid_geometry.get_json()["error"])
+
+        too_many = self.client.post(
+            "/api/annotation/save",
+            json={
+                "project_id": project["id"],
+                "image_index": 0,
+                "annotations": [{}] * (
+                    app_module.MAX_ANNOTATIONS_PER_IMAGE + 1
+                ),
+            },
+        )
+        self.assertEqual(too_many.status_code, 400)
+        self.assertIn("标注数量", too_many.get_json()["error"])
+
+    def test_oversized_request_returns_json_413(self):
+        app_module.app.config["MAX_CONTENT_LENGTH"] = 128
+        response = self.client.post(
+            "/api/project/create",
+            data=json.dumps({"name": "x" * 256}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 413)
+        self.assertTrue(response.is_json)
+        self.assertFalse(response.get_json()["success"])
+
+    def test_cross_origin_writes_are_rejected_without_cors(self):
+        response = self.client.post(
+            "/api/project/create",
+            json={"name": "cross-site"},
+            headers={"Origin": "https://attacker.example"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.get_json()["success"])
+
+        page = self.client.get(
+            "/",
+            headers={"Origin": "https://attacker.example"},
+        )
+        self.assertNotIn("Access-Control-Allow-Origin", page.headers)
+
+    def test_access_token_protects_pages_and_api(self):
+        app_module.app.config["ACCESS_TOKEN"] = "lan-secret"
+        unauthorized = self.client.get("/api/system/status")
+        self.assertEqual(unauthorized.status_code, 401)
+
+        bootstrap = self.client.get(
+            "/?access_token=lan-secret",
+            follow_redirects=True,
+        )
+        self.assertEqual(bootstrap.status_code, 200)
+        authorized = self.client.get("/api/system/status")
+        self.assertEqual(authorized.status_code, 200)
 
     def test_malformed_json_always_returns_json_error(self):
         for route in (

@@ -1,4 +1,7 @@
 import os
+import hmac
+import ipaddress
+import secrets
 import sys
 import subprocess
 import threading
@@ -8,14 +11,22 @@ import atexit
 import re
 import shutil
 import math
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 # 添加SAM3到路径 (使用本地 SAM_src 目录)
 sam3_src = Path(__file__).parent / "SAM_src"
 sys.path.insert(0, str(sam3_src))
 
-from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
-from flask_cors import CORS
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    send_from_directory,
+)
+from werkzeug.exceptions import RequestEntityTooLarge
 import json
 import uuid
 import requests
@@ -27,10 +38,11 @@ from exports.yolo_exporter import YOLOExporter
 from exports.coco_exporter import COCOExporter
 
 app = Flask(__name__)
-CORS(app)
 
-# 全局配置
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
+# 本地工具默认不接受跨站请求；显式 LAN 模式通过访问令牌保护。
+app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024
+app.config['ACCESS_TOKEN'] = None
+app.config['ACCESS_TOKEN_COOKIE'] = 'sam3_access_token'
 app.config['UPLOAD_FOLDER'] = Path(__file__).parent / 'uploads'
 app.config['UPLOAD_FOLDER'].mkdir(exist_ok=True)
 
@@ -44,6 +56,11 @@ WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
 VALID_SMOOTH_LEVELS = frozenset({"none", "low", "medium", "high", "ultra"})
 
 
+MAX_CLASSES = 1000
+MAX_CLASS_NAME_LENGTH = 200
+MAX_ANNOTATIONS_PER_IMAGE = 10_000
+MAX_POLYGON_POINTS = 100_000
+MAX_TOTAL_POLYGON_POINTS = 1_000_000
 def normalize_directory(
     raw_path,
     field_name,
@@ -88,10 +105,14 @@ def normalize_classes(raw_classes):
         raw_classes = raw_classes.split(',')
     if not isinstance(raw_classes, list):
         raise ValueError("类别必须是数组或逗号分隔的字符串")
+    if len(raw_classes) > MAX_CLASSES:
+        raise ValueError(f"类别数量不能超过 {MAX_CLASSES}")
     classes = []
     seen = set()
     for item in raw_classes:
         name = str(item).strip()
+        if len(name) > MAX_CLASS_NAME_LENGTH:
+            raise ValueError(f"类别名称不能超过 {MAX_CLASS_NAME_LENGTH} 个字符")
         if name and name not in seen:
             seen.add(name)
             classes.append(name)
@@ -107,6 +128,8 @@ def normalize_smooth_level(raw_level) -> str:
 
 def normalize_chat_completions_url(raw_url) -> str:
     api_url = str(raw_url or "").strip()
+    if len(api_url) > 2048:
+        raise ValueError("API 地址不能超过 2048 个字符")
     parsed = urlparse(api_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("API 地址必须是有效的 http(s) URL")
@@ -184,6 +207,88 @@ def normalize_prompt_boxes(raw_boxes) -> list:
         boxes.append([x1, y1, x2, y2, int(bool(label))])
     return boxes
 
+def normalize_annotation_payload(raw_annotations) -> list:
+    """限制标注数量和几何复杂度，并拒绝非有限坐标。"""
+    if not isinstance(raw_annotations, list):
+        raise ValueError("annotations 必须是数组")
+    if len(raw_annotations) > MAX_ANNOTATIONS_PER_IMAGE:
+        raise ValueError(
+            f"单张图片标注数量不能超过 {MAX_ANNOTATIONS_PER_IMAGE}"
+        )
+
+    normalized = []
+    total_points = 0
+    for index, raw_annotation in enumerate(raw_annotations):
+        if not isinstance(raw_annotation, dict):
+            raise ValueError(f"标注 {index + 1} 必须是对象")
+        annotation = dict(raw_annotation)
+        for field_name in ("id", "class_name", "label"):
+            if field_name not in annotation:
+                continue
+            value = str(annotation[field_name]).strip()
+            limit = 128 if field_name == "id" else MAX_CLASS_NAME_LENGTH
+            if len(value) > limit:
+                raise ValueError(
+                    f"标注 {index + 1} 的 {field_name} 不能超过 {limit} 个字符"
+                )
+            annotation[field_name] = value
+
+        bbox = annotation.get("bbox")
+        if bbox is not None:
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                raise ValueError(f"标注 {index + 1} 的 bbox 必须包含 4 个坐标")
+            bbox = [
+                _finite_number(value, f"标注 {index + 1} bbox")
+                for value in bbox
+            ]
+            if bbox[2] < bbox[0] or bbox[3] < bbox[1]:
+                raise ValueError(f"标注 {index + 1} 的 bbox 边界顺序无效")
+            annotation["bbox"] = bbox
+
+        polygon = annotation.get("polygon")
+        if polygon is not None:
+            if not isinstance(polygon, list):
+                raise ValueError(f"标注 {index + 1} 的 polygon 必须是数组")
+            if len(polygon) > MAX_POLYGON_POINTS:
+                raise ValueError(
+                    f"单个多边形点数不能超过 {MAX_POLYGON_POINTS}"
+                )
+            total_points += len(polygon)
+            if total_points > MAX_TOTAL_POLYGON_POINTS:
+                raise ValueError(
+                    f"单张图片多边形总点数不能超过 {MAX_TOTAL_POLYGON_POINTS}"
+                )
+            normalized_polygon = []
+            for point in polygon:
+                if not isinstance(point, list) or len(point) != 2:
+                    raise ValueError(
+                        f"标注 {index + 1} 的多边形点必须为 [x, y]"
+                    )
+                normalized_polygon.append([
+                    _finite_number(point[0], f"标注 {index + 1} polygon x"),
+                    _finite_number(point[1], f"标注 {index + 1} polygon y"),
+                ])
+            annotation["polygon"] = normalized_polygon
+
+        if "score" in annotation:
+            score = _finite_number(
+                annotation["score"],
+                f"标注 {index + 1} score",
+            )
+            if not 0 <= score <= 1:
+                raise ValueError(f"标注 {index + 1} 的 score 必须在 0 到 1 之间")
+            annotation["score"] = score
+        if "area" in annotation:
+            area = _finite_number(
+                annotation["area"],
+                f"标注 {index + 1} area",
+            )
+            if area < 0:
+                raise ValueError(f"标注 {index + 1} 的 area 不能为负数")
+            annotation["area"] = area
+        normalized.append(annotation)
+    return normalized
+
 
 def resolve_allowed_image(raw_path):
     value = str(raw_path or "").strip()
@@ -208,6 +313,76 @@ def resolve_allowed_image(raw_path):
 
 def error_response(message, status=400, **details):
     return jsonify({"success": False, "error": str(message), **details}), status
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_request_too_large(_error):
+    return error_response("请求体不能超过 32 MiB", 413)
+
+
+def _tokens_match(left, right) -> bool:
+    return bool(left and right) and hmac.compare_digest(str(left), str(right))
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == 'localhost':
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@app.before_request
+def enforce_request_security():
+    """阻止跨站写请求，并在显式 LAN 模式校验访问令牌。"""
+    access_token = app.config.get('ACCESS_TOKEN')
+    if access_token:
+        cookie_token = request.cookies.get(app.config['ACCESS_TOKEN_COOKIE'])
+        query_token = request.args.get('access_token')
+        bootstrap_request = (
+            request.method == 'GET'
+            and request.endpoint in {'index', 'video_page'}
+            and _tokens_match(query_token, access_token)
+        )
+        if not bootstrap_request and not _tokens_match(
+            cookie_token,
+            access_token,
+        ):
+            return error_response('未授权访问', 401)
+
+    if request.method not in {'GET', 'HEAD', 'OPTIONS'}:
+        if request.headers.get('Sec-Fetch-Site') == 'cross-site':
+            return error_response('拒绝跨站请求', 403)
+        origin = request.headers.get('Origin')
+        if origin:
+            parsed_origin = urlparse(origin)
+            parsed_host = urlparse(request.host_url)
+            if (
+                parsed_origin.scheme,
+                parsed_origin.netloc,
+            ) != (
+                parsed_host.scheme,
+                parsed_host.netloc,
+            ):
+                return error_response('拒绝跨站请求', 403)
+    return None
+
+
+def render_protected_page(template_name: str):
+    """LAN 模式首次携带令牌后写入 HttpOnly 会话 Cookie。"""
+    access_token = app.config.get('ACCESS_TOKEN')
+    query_token = request.args.get('access_token')
+    if access_token and _tokens_match(query_token, access_token):
+        response = redirect(request.path)
+        response.set_cookie(
+            app.config['ACCESS_TOKEN_COOKIE'],
+            access_token,
+            httponly=True,
+            samesite='Strict',
+            path='/',
+        )
+        return response
+    return render_template(template_name)
 
 
 def get_sam3_service():
@@ -235,13 +410,13 @@ atexit.register(shutdown_services)
 @app.route('/')
 def index():
     """主页面"""
-    return render_template('index.html')
+    return render_protected_page('index.html')
 
 
 @app.route('/video')
 def video_page():
     """视频标注页面"""
-    return render_template('video.html')
+    return render_protected_page('video.html')
 
 # ==================== 系统 API ====================
 
@@ -340,6 +515,10 @@ def create_project():
         data = json_body()
         project_id = str(uuid.uuid4())[:8]
         name = str(data.get('name') or f'项目_{project_id}').strip()
+        if not name:
+            raise ValueError('项目名称不能为空')
+        if len(name) > 200:
+            raise ValueError('项目名称不能超过 200 个字符')
         image_dir = normalize_directory(
             data.get('image_dir'),
             '图片目录',
@@ -387,6 +566,8 @@ def update_project(project_id):
             name = str(data['name']).strip()
             if not name:
                 raise ValueError('项目名称不能为空')
+            if len(name) > 200:
+                raise ValueError('项目名称不能超过 200 个字符')
             updates['name'] = name
         if 'image_dir' in data:
             updates['image_dir'] = normalize_directory(
@@ -495,6 +676,8 @@ def segment_by_text():
         prompt = str(data.get('prompt', '')).strip()
         if not prompt:
             raise ValueError('文本提示不能为空')
+        if len(prompt) > 500:
+            raise ValueError('文本提示不能超过 500 个字符')
         confidence = float(data.get('confidence', 0.5))
         if not 0 <= confidence <= 1:
             raise ValueError('置信度必须在 0 到 1 之间')
@@ -552,7 +735,11 @@ def batch_segment():
         prompt = str(data.get('prompt', '')).strip()
         if not prompt:
             raise ValueError('文本提示不能为空')
+        if len(prompt) > 500:
+            raise ValueError('文本提示不能超过 500 个字符')
         class_name = str(data.get('class_name') or prompt).strip()
+        if not class_name or len(class_name) > MAX_CLASS_NAME_LENGTH:
+            raise ValueError('类别名称无效或过长')
         start_index = int(data.get('start_index', 0))
         end_index = int(data.get('end_index', -1))
         confidence = float(data.get('confidence', 0.5))
@@ -624,9 +811,9 @@ def save_annotation():
     """立即持久化当前图片的完整标注列表。"""
     try:
         data = json_body()
-        annotations = data.get('annotations', [])
-        if not isinstance(annotations, list):
-            raise ValueError('annotations 必须是数组')
+        annotations = normalize_annotation_payload(
+            data.get('annotations', []),
+        )
         annotation_manager.save_annotations(
             data.get('project_id'),
             data.get('image_index'),
@@ -656,9 +843,7 @@ def update_annotation():
     """更新单个标注。"""
     try:
         data = json_body()
-        updates = data.get('updates', {})
-        if not isinstance(updates, dict):
-            raise ValueError('updates 必须是对象')
+        updates = normalize_annotation_payload([data.get('updates', {})])[0]
         annotation_manager.update_annotation(
             data.get('project_id'),
             data.get('image_index'),
@@ -1067,6 +1252,10 @@ def ai_translate():
         text = str(data.get("text") or "").strip()
         api_key = str(data.get("api_key") or "").strip()
         model = str(data.get("model") or "gpt-3.5-turbo").strip()
+        if len(text) > 2000:
+            raise ValueError("待翻译文本不能超过 2000 个字符")
+        if len(api_key) > 8192 or not model or len(model) > 200:
+            raise ValueError("API 密钥或模型名称无效")
         if not text:
             raise ValueError("文本为空")
         if not api_key:
@@ -1145,6 +1334,8 @@ def ai_test():
         data = json_body()
         api_key = str(data.get("api_key") or "").strip()
         model = str(data.get("model") or "gpt-3.5-turbo").strip()
+        if len(api_key) > 8192 or not model or len(model) > 200:
+            raise ValueError("API 密钥或模型名称无效")
         if not api_key:
             raise ValueError("API 地址和密钥不能为空")
         api_url = normalize_chat_completions_url(data.get("api_url"))
@@ -1275,24 +1466,29 @@ def exit_app():
     return jsonify({'success': True})
 
 
-def _find_available_port(preferred=(5000, 5001, 5055, 8000, 8080)):
-    """选择可用端口。
-
-    macOS Sonoma/Sequoia 默认占用 5000 端口（AirPlay Receiver），按候选顺序
-    回退；全部占用时让操作系统分配空闲端口。
-    """
+def _find_available_port(
+    host='127.0.0.1',
+    preferred=(5000, 5001, 5055, 8000, 8080),
+):
+    """在目标监听地址上选择端口，候选均占用时由系统分配。"""
     import socket
+
+    family = socket.AF_INET6 if ':' in host else socket.AF_INET
     for port in preferred:
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(("0.0.0.0", port))
+            with socket.socket(family, socket.SOCK_STREAM) as server_socket:
+                server_socket.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_REUSEADDR,
+                    1,
+                )
+                server_socket.bind((host, port))
                 return port
         except OSError:
             continue
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("0.0.0.0", 0))
-        return s.getsockname()[1]
+    with socket.socket(family, socket.SOCK_STREAM) as server_socket:
+        server_socket.bind((host, 0))
+        return server_socket.getsockname()[1]
 
 
 if __name__ == '__main__':
@@ -1300,15 +1496,29 @@ if __name__ == '__main__':
     print("SAM3 AN - 数据标注工具")
     print("=" * 50)
 
-    # 在后台线程中等待服务就绪后打开浏览器
-    port = _find_available_port()
-    url = f"http://localhost:{port}"
-    if port != 5000:
-        print(f"[INFO] 默认端口 5000 被占用（macOS AirPlay Receiver 常见），改用端口 {port}")
+    host = os.environ.get('SAM3_HOST', '127.0.0.1').strip() or '127.0.0.1'
+    access_token = os.environ.get('SAM3_ACCESS_TOKEN', '').strip()
+    if not _is_loopback_host(host):
+        access_token = access_token or secrets.token_urlsafe(32)
+        app.config['ACCESS_TOKEN'] = access_token
+        print('[WARN] 已启用 LAN 监听；所有页面和 API 均需要访问令牌')
+        print(f'[INFO] LAN 访问令牌: {access_token}')
+    elif access_token:
+        app.config['ACCESS_TOKEN'] = access_token
 
-    print(f"[INFO] 正在启动服务器...")
-    print(f"[INFO] 服务就绪后将自动打开浏览器")
+    port = _find_available_port(host)
+    browser_host = 'localhost' if host in {'0.0.0.0', '::'} else host
+    if ':' in browser_host and not browser_host.startswith('['):
+        browser_host = f'[{browser_host}]'
+    url = f"http://{browser_host}:{port}"
+    if app.config['ACCESS_TOKEN']:
+        url = f"{url}/?{urlencode({'access_token': app.config['ACCESS_TOKEN']})}"
+    if port != 5000:
+        print(f"[INFO] 默认端口 5000 被占用，改用端口 {port}")
+
+    print("[INFO] 正在启动服务器...")
+    print("[INFO] 服务就绪后将自动打开浏览器")
     print("=" * 50)
 
-    # 启动Flask服务器（关闭debug模式以避免重复打开浏览器）
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    # 默认仅监听本机；SAM3_HOST 可显式开启其他地址。
+    app.run(host=host, port=port, debug=False, threaded=True)
