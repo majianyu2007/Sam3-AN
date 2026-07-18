@@ -20,9 +20,10 @@
             <!-- 左侧面板 - 控制中心与图片列表 -->
             <div class="left-panel" id="leftPanel">
                 <!-- 折叠按钮 -->
-                <div class="panel-collapse-btn" id="leftToggleBtn" onclick="toggleLeftPanel()" title="折叠面板">
+                <button type="button" class="panel-collapse-btn" id="leftToggleBtn"
+                        onclick="toggleLeftPanel()" title="折叠左侧面板" aria-label="折叠左侧面板">
                     <i class="bi bi-chevron-double-left"></i>
-                </div>
+                </button>
                 <!-- 顶部控制区 -->
                 <div class="sidebar-header">
                     <div class="app-brand">
@@ -75,12 +76,14 @@
             <!-- 中间 - 标注画布 -->
             <div class="center-panel">
                 <!-- 展开按钮（面板折叠时显示） -->
-                <div class="panel-expand-btn left" id="leftExpandBtn" onclick="toggleLeftPanel()" title="展开左侧面板">
+                <button type="button" class="panel-expand-btn left" id="leftExpandBtn"
+                        onclick="toggleLeftPanel()" title="展开左侧面板" aria-label="展开左侧面板">
                     <i class="bi bi-chevron-double-right"></i>
-                </div>
-                <div class="panel-expand-btn right" id="rightExpandBtn" onclick="toggleRightPanel()" title="展开右侧面板">
+                </button>
+                <button type="button" class="panel-expand-btn right" id="rightExpandBtn"
+                        onclick="toggleRightPanel()" title="展开右侧面板" aria-label="展开右侧面板">
                     <i class="bi bi-chevron-double-left"></i>
-                </div>
+                </button>
                 <div class="canvas-toolbar">
                     <!-- AI分割工具 -->
                     <div class="toolbar-group" title="AI分割工具">
@@ -105,6 +108,11 @@
                         <button type="button" class="btn btn-tool manual-tool"
                                 id="toolPolygon" onclick="setTool('polygon')" title="手动绘制多边形 (G)">
                             <i class="bi bi-hexagon"></i>
+                        </button>
+                        <button type="button" class="btn btn-tool manual-tool"
+                                id="finishPolygonButton" onclick="finishPolygon()"
+                                title="完成多边形 (Enter)" aria-label="完成多边形" hidden disabled>
+                            <i class="bi bi-check-lg"></i>
                         </button>
                     </div>
 
@@ -222,16 +230,17 @@
             <!-- 右侧面板 - 标注信息 -->
             <div class="right-panel" id="rightPanel">
                 <!-- 折叠按钮 -->
-                <div class="panel-collapse-btn right" id="rightToggleBtn" onclick="toggleRightPanel()" title="折叠面板">
+                <button type="button" class="panel-collapse-btn right" id="rightToggleBtn"
+                        onclick="toggleRightPanel()" title="折叠右侧面板" aria-label="折叠右侧面板">
                     <i class="bi bi-chevron-double-right"></i>
-                </div>
+                </button>
                 <!-- 类别管理 -->
                 <div class="panel-section">
                     <h6><i class="bi bi-tags"></i> 类别管理</h6>
                     <div class="input-group input-group-sm mb-2">
                         <input type="text" class="form-control" id="newClassName"
                                placeholder="新类别名称">
-                        <button class="btn btn-outline-primary" onclick="addClass()">
+                        <button class="btn btn-outline-primary" onclick="addClass()" aria-label="添加类别">
                             <i class="bi bi-plus-lg"></i>
                         </button>
                     </div>
@@ -298,7 +307,7 @@
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title">项目管理</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
                 </div>
                 <div class="modal-body">
                     <ul class="nav nav-tabs" id="projectTabs">
@@ -365,7 +374,7 @@
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title"><i class="bi bi-download me-2"></i>导出数据集</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
                 </div>
                 <div class="modal-body">
                     <div class="row">
@@ -438,7 +447,7 @@
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title"><i class="bi bi-translate me-2"></i>AI翻译配置</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
                 </div>
                 <div class="modal-body">
                     <div class="alert alert-info small mb-3">
@@ -469,7 +478,9 @@
                         <div class="input-group">
                             <input type="password" class="form-control" id="aiApiKey"
                                    placeholder="sk-xxxxxxxxxxxxxxxx">
-                            <button class="btn btn-outline-secondary" type="button" onclick="toggleApiKeyVisibility()">
+                            <button class="btn btn-outline-secondary" type="button"
+                                    onclick="toggleApiKeyVisibility()" title="显示或隐藏 API 密钥"
+                                    aria-label="显示或隐藏 API 密钥">
                                 <i class="bi bi-eye" id="apiKeyEyeIcon"></i>
                             </button>
                         </div>
@@ -530,7 +541,7 @@
             <div class="toast-header">
                 <i class="bi bi-cpu me-2 toast-icon"></i>
                 <strong class="me-auto" id="toastTitle">通知</strong>
-                <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+                <button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="关闭"></button>
             </div>
             <div class="toast-body" id="toastBody"></div>
         </div>

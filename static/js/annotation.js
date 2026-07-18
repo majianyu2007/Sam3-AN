@@ -49,6 +49,9 @@ let renderedImages = null;
 let imageListRafId = null;
 let imageSearchTimer = null;
 let imageLoadToken = 0;
+let projectLoadToken = 0;
+let imageLoading = false;
+let exportPreviewController = null;
 const MAX_ANNOTATION_HISTORY = 30;
 let annotationAutosaveTimer = null;
 let saveQueue = Promise.resolve();
@@ -163,6 +166,19 @@ async function apiRequest(url, options = {}) {
     }
     return data;
 }
+function applyAccessibleButtonNames(root = document) {
+    root.querySelectorAll('button[title]:not([aria-label])').forEach(button => {
+        if (!button.textContent.trim()) {
+            button.setAttribute('aria-label', button.title);
+        }
+    });
+}
+function cancelPreviewRequests() {
+    exportPreviewController?.abort();
+    exportPreviewController = null;
+}
+
+
 
 let confirmationResolver = null;
 
@@ -394,23 +410,15 @@ function initCanvas() {
     canvas = document.getElementById('annotationCanvas');
     ctx = canvas.getContext('2d');
 
-    canvas.addEventListener('mousedown', onMouseDown);
-    canvas.addEventListener('mousemove', onMouseMove);
-    canvas.addEventListener('mouseup', onMouseUp);
-    canvas.addEventListener('wheel', onWheel);
+    canvas.addEventListener('pointerdown', onMouseDown);
+    canvas.addEventListener('pointermove', onMouseMove);
+    canvas.addEventListener('pointerup', onMouseUp);
+    canvas.addEventListener('pointercancel', cancelPointerInteraction);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
     canvas.addEventListener('dblclick', onDoubleClick);
 
     // 禁用右键菜单（用于右键拖动）
     canvas.addEventListener('contextmenu', onContextMenu);
-
-    // 鼠标离开canvas时结束拖动
-    canvas.addEventListener('mouseleave', () => {
-        if (state.panning) {
-            state.panning = false;
-            state.panStart = null;
-            canvas.style.cursor = state.currentTool === 'edit' ? 'default' : 'crosshair';
-        }
-    });
 
     // 键盘快捷键
     document.addEventListener('keydown', onKeyDown);
@@ -433,6 +441,7 @@ function initToolbarState() {
 
 function initEventListeners() {
     // 置信度滑块
+    applyAccessibleButtonNames();
     document.getElementById('confidenceSlider').addEventListener('input', (e) => {
         state.confidence = e.target.value / 100;
         document.getElementById('confidenceValue').textContent = state.confidence.toFixed(2);
@@ -505,6 +514,9 @@ function updateToolGuidance() {
     document.getElementById('segmentPromptButton').hidden = !promptTool;
     document.getElementById('clearPromptButton').hidden =
         !promptTool && state.currentTool !== 'polygon';
+    const finishPolygonButton = document.getElementById('finishPolygonButton');
+    finishPolygonButton.hidden = state.currentTool !== 'polygon';
+    finishPolygonButton.disabled = state.tempPolygon.length < 3;
 }
 
 function setLabel(isPositive) {
@@ -527,6 +539,9 @@ function getCanvasCoords(e) {
 
 function onMouseDown(e) {
     e.preventDefault();
+    if (e.pointerId !== undefined) {
+        canvas.setPointerCapture(e.pointerId);
+    }
 
     // 右键长按拖动视图
     if (e.button === 2) {
@@ -607,8 +622,23 @@ function onMouseMove(e) {
     }
 }
 
+function cancelPointerInteraction(e) {
+    state.panning = false;
+    state.panStart = null;
+    state.drawing = false;
+    state.drawStart = null;
+    if (e.pointerId !== undefined && canvas.hasPointerCapture(e.pointerId)) {
+        canvas.releasePointerCapture(e.pointerId);
+    }
+    updateCursor();
+    redraw();
+}
+
 function onMouseUp(e) {
     // 结束平移拖动
+    if (e.pointerId !== undefined && canvas.hasPointerCapture(e.pointerId)) {
+        canvas.releasePointerCapture(e.pointerId);
+    }
     if (state.panning) {
         state.panning = false;
         state.panStart = null;
@@ -1168,6 +1198,7 @@ function addPoint(x, y) {
 
 function addPolygonPoint(x, y) {
     state.tempPolygon.push([x, y]);
+    updateToolGuidance();
     redraw();
 
     if (state.tempPolygon.length === 1) {
@@ -1216,6 +1247,7 @@ function finishPolygon() {
 
     state.annotations.push(annotation);
     state.tempPolygon = [];
+    updateToolGuidance();
     recordAnnotationMutation();
     showToast('已添加', `${className} · 正在自动保存`);
 }
@@ -1223,6 +1255,7 @@ function finishPolygon() {
 function cancelPolygon() {
     if (state.tempPolygon.length > 0) {
         state.tempPolygon = [];
+        updateToolGuidance();
         redraw();
         showToast('提示', '已取消多边形绘制');
     }
@@ -1231,6 +1264,7 @@ function cancelPolygon() {
 function undoPolygonPoint() {
     if (state.tempPolygon.length > 0) {
         state.tempPolygon.pop();
+        updateToolGuidance();
         redraw();
     }
 }
@@ -1269,6 +1303,7 @@ function clearTempPrompts() {
     state.tempBoxes = [];
     state.tempPoints = [];
     state.tempPolygon = [];
+    updateToolGuidance();
     redraw();
     showToast('提示', '已清除未完成的临时标记');
 }
@@ -1452,7 +1487,7 @@ function showClassSelectModal(prompt) {
                 <div class="modal-content">
                     <div class="modal-header">
                         <h5 class="modal-title">选择类别</h5>
-                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
                     </div>
                     <div class="modal-body">
                         <p class="small text-muted mb-3">提示词 "${escapeHtml(prompt)}" 未匹配到类别，请选择：</p>
@@ -1710,6 +1745,7 @@ async function loadProjects() {
                 </div>
             </div>
         `).join('');
+        applyAccessibleButtonNames(list);
 
         list.querySelectorAll('.project-item').forEach(item => {
             const projectId = item.dataset.projectId;
@@ -1811,7 +1847,7 @@ async function updateProject() {
             updateClassList();
             if (directoryChanged) {
                 await rescanProjectImages({ notify: true });
-                if (state.images.length > 0) loadImage(0);
+                if (state.images.length > 0) await loadImage(0);
             }
         }
 
@@ -1923,7 +1959,7 @@ async function createProject() {
         await selectProject(data.project.id);
         if (data.project.image_dir) {
             await rescanProjectImages();
-            if (state.images.length > 0) loadImage(0);
+            if (state.images.length > 0) await loadImage(0);
         }
         bootstrap.Modal.getInstance(document.getElementById('projectModal'))?.hide();
         showToast(
@@ -1938,22 +1974,57 @@ async function createProject() {
 }
 
 async function selectProject(projectId) {
+    const projectToken = ++projectLoadToken;
+    const navigationToken = ++imageLoadToken;
+    cancelPreviewRequests();
+    setImageLoading(false);
+    updateCurrentImageInfo();
     if (state.dirty && !(await saveAnnotations(false))) {
         showToast('未切换项目', '当前标注尚未保存，请重试', 'warning');
         return false;
     }
+    if (
+        projectToken !== projectLoadToken
+        || navigationToken !== imageLoadToken
+    ) return false;
+
     try {
         const data = await apiRequest(`/api/project/${projectId}`);
+        if (
+            projectToken !== projectLoadToken
+            || navigationToken !== imageLoadToken
+        ) return false;
         const project = data.project;
+        const images = project.images || [];
+        const currentIndex = Math.min(
+            Math.max(Number(project.current_index) || 0, 0),
+            Math.max(images.length - 1, 0)
+        );
+        let loadedImage = null;
+        if (images.length > 0) {
+            setImageLoading(true, images[currentIndex], currentIndex, images.length);
+            loadedImage = await loadImageElement(images[currentIndex]);
+            if (
+                projectToken !== projectLoadToken
+                || navigationToken !== imageLoadToken
+            ) return false;
+        }
+
         state.projectId = projectId;
         state.imageDir = project.image_dir || '';
         state.outputDir = project.output_dir || '';
         state.classes = project.classes || [];
-        state.images = project.images || [];
-        state.currentIndex = Math.min(
-            Math.max(Number(project.current_index) || 0, 0),
-            Math.max(state.images.length - 1, 0)
+        state.images = images;
+        state.currentIndex = currentIndex;
+        state.annotations = structuredClone(
+            images[currentIndex]?.annotations || []
         );
+        state.tempPoints = [];
+        state.tempBoxes = [];
+        state.tempPolygon = [];
+        currentImage = loadedImage;
+        resetAnnotationHistory();
+        invalidateStaticCache();
         if (!state.classes.includes(state.currentClass)) {
             state.currentClass = state.classes[0] || null;
         }
@@ -1961,22 +2032,29 @@ async function selectProject(projectId) {
         document.getElementById('projectName').textContent = project.name;
         document.getElementById('exportOutputDir').value = state.outputDir;
         updateClassList();
-        updateImageList();
+        updateAnnotationList();
+        setImageLoading(false);
+        updateCurrentImageInfo();
+        updateImageList({ scrollCurrent: true });
         bootstrap.Modal.getInstance(document.getElementById('projectModal'))?.hide();
 
-        if (state.images.length > 0) {
-            loadImage(state.currentIndex);
+        if (currentImage) {
+            fitToView();
+            preloadAdjacentImages(currentIndex);
         } else {
-            state.annotations = [];
-            resetAnnotationHistory();
-            currentImage = null;
-            updateAnnotationList();
             ctx.clearRect(0, 0, canvas.width, canvas.height);
         }
         saveWorkState();
         return true;
     } catch (error) {
-        showToast('选择项目失败', error.message, 'danger');
+        if (
+            projectToken === projectLoadToken
+            && navigationToken === imageLoadToken
+        ) {
+            setImageLoading(false);
+            updateCurrentImageInfo();
+            showToast('选择项目失败', error.message, 'danger');
+        }
         return false;
     }
 }
@@ -1997,7 +2075,7 @@ async function loadProjectImages(imageDir = state.imageDir) {
         state.images = data.images;
         updateImageList();
         if (state.images.length > 0) {
-            loadImage(0);
+            if (!(await loadImage(0))) return false;
             showToast('成功', `已加载 ${data.count} 张图片`);
         } else {
             showToast('图片目录为空', '没有找到支持的图片格式', 'warning');
@@ -2057,9 +2135,9 @@ function updateImageList({ scrollCurrent = false } = {}) {
     document.getElementById('progressText').textContent =
         `已标注: ${annotatedCount}/${total} (${percent}%)`;
     document.getElementById('prevImageButton').disabled =
-        total === 0 || state.currentIndex <= 0;
+        imageLoading || total === 0 || state.currentIndex <= 0;
     document.getElementById('nextImageButton').disabled =
-        total === 0 || state.currentIndex >= total - 1;
+        imageLoading || total === 0 || state.currentIndex >= total - 1;
 
     if (renderedImages !== state.images) {
         renderedImages = state.images;
@@ -2091,42 +2169,84 @@ function filterImages(query) {
     updateImageList();
 }
 
+function loadImageElement(image) {
+    return new Promise((resolve, reject) => {
+        const nextImage = new Image();
+        nextImage.onload = () => resolve(nextImage);
+        nextImage.onerror = () => reject(
+            new Error(`无法读取图片：${image.path}`)
+        );
+        nextImage.src = `/api/image/serve?path=${encodeURIComponent(image.path)}`;
+    });
+}
+
+function setImageLoading(loading, image = null, index = 0, total = 0) {
+    imageLoading = loading;
+    const list = document.getElementById('imageList');
+    list.setAttribute('aria-busy', String(loading));
+    list.classList.toggle('is-loading', loading);
+    if (loading && image) {
+        document.getElementById('currentImageInfo').textContent =
+            `正在加载 ${index + 1} / ${total} - ${image.filename}`;
+    }
+    const imageTotal = state.images.length;
+    document.getElementById('prevImageButton').disabled =
+        loading || imageTotal === 0 || state.currentIndex <= 0;
+    document.getElementById('nextImageButton').disabled =
+        loading || imageTotal === 0 || state.currentIndex >= imageTotal - 1;
+}
+
+function updateCurrentImageInfo() {
+    const image = state.images[state.currentIndex];
+    document.getElementById('currentImageInfo').textContent = image
+        ? `${state.currentIndex + 1} / ${state.images.length} - ${image.filename}`
+        : '未加载图片';
+}
+
 async function loadImage(index) {
     if (index < 0 || index >= state.images.length) return false;
+    const loadToken = ++imageLoadToken;
+    cancelPreviewRequests();
+    setImageLoading(false);
+    updateCurrentImageInfo();
     if (state.dirty && !(await saveAnnotations(false))) {
-        showToast('未切换图片', '当前标注保存失败，请先解决保存问题', 'warning');
+        if (loadToken === imageLoadToken) {
+            showToast('未切换图片', '当前标注保存失败，请先解决保存问题', 'warning');
+        }
         return false;
     }
-
-    state.currentIndex = index;
-    state.annotations = structuredClone(state.images[index].annotations || []);
-    state.tempPoints = [];
-    state.tempBoxes = [];
-    state.tempPolygon = [];
-    resetAnnotationHistory();
-    invalidateStaticCache();
-    saveWorkState();
+    if (loadToken !== imageLoadToken) return false;
 
     const image = state.images[index];
-    const loadToken = ++imageLoadToken;
-    const nextImage = new Image();
-    nextImage.onload = () => {
-        if (loadToken !== imageLoadToken) return;
+    setImageLoading(true, image, index, state.images.length);
+    try {
+        const nextImage = await loadImageElement(image);
+        if (loadToken !== imageLoadToken) return false;
+
+        state.currentIndex = index;
+        state.annotations = structuredClone(image.annotations || []);
+        state.tempPoints = [];
+        state.tempBoxes = [];
+        state.tempPolygon = [];
+        resetAnnotationHistory();
         currentImage = nextImage;
+        invalidateStaticCache();
+        setImageLoading(false);
         fitToView();
         updateAnnotationList();
         updateImageList({ scrollCurrent: true });
-        document.getElementById('currentImageInfo').textContent =
-            `${index + 1} / ${state.images.length} - ${image.filename}`;
+        updateCurrentImageInfo();
+        saveWorkState();
         preloadAdjacentImages(index);
-    };
-    nextImage.onerror = () => {
+        return true;
+    } catch (error) {
         if (loadToken === imageLoadToken) {
-            showToast('图片加载失败', image.path, 'danger');
+            setImageLoading(false);
+            updateCurrentImageInfo();
+            showToast('图片加载失败', error.message, 'danger');
         }
-    };
-    nextImage.src = `/api/image/serve?path=${encodeURIComponent(image.path)}`;
-    return true;
+        return false;
+    }
 }
 
 function preloadAdjacentImages(index) {
@@ -2171,13 +2291,14 @@ function updateAnnotationList() {
                     <div class="score">置信度: ${score.toFixed(2)}</div>
                 </div>
                 <div class="actions">
-                    <button class="btn btn-outline-danger btn-sm delete-annotation">
+                    <button class="btn btn-outline-danger btn-sm delete-annotation" title="删除标注">
                         <i class="bi bi-trash"></i>
                     </button>
                 </div>
             </div>
         `;
     }).join('');
+    applyAccessibleButtonNames(list);
     list.querySelectorAll('.annotation-item').forEach(item => {
         const id = item.dataset.annotationId;
         item.addEventListener('click', () => selectAnnotation(id));
@@ -2319,7 +2440,8 @@ function updateClassList() {
              data-class-name="${escapeHtml(className)}" title="点击选择此类别">
             <div class="color-dot" style="background-color: ${colors[index % colors.length]}"></div>
             <span class="name">${escapeHtml(className)}</span>
-            <i class="bi bi-x delete-btn" title="删除类别"></i>
+            <button type="button" class="bi bi-x delete-btn" title="删除类别"
+                    aria-label="删除类别"></button>
         </div>
     `).join('');
     list.querySelectorAll('.class-item').forEach(item => {
@@ -2463,43 +2585,67 @@ async function generateExportPreview() {
         return;
     }
 
+    exportPreviewController?.abort();
+    const controller = new AbortController();
+    exportPreviewController = controller;
+    const projectId = state.projectId;
+    const imageIndex = state.currentIndex;
     const smoothLevel = document.getElementById('exportSmoothLevel').value;
     const previewImage = document.getElementById('exportPreviewImage');
     const placeholder = document.querySelector('.preview-placeholder');
     const statsDiv = document.getElementById('exportPreviewStats');
 
-    // 显示加载状态
-    if (placeholder) placeholder.innerHTML = '<div class="spinner-border spinner-border-sm"></div><p>生成预览中...</p>';
+    if (placeholder) {
+        placeholder.innerHTML = '<div class="spinner-border spinner-border-sm"></div><p>生成预览中...</p>';
+        placeholder.style.display = 'block';
+    }
 
     try {
         const data = await apiRequest('/api/export/preview', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
             body: JSON.stringify({
-                project_id: state.projectId,
-                image_index: state.currentIndex,
+                project_id: projectId,
+                image_index: imageIndex,
                 smooth_level: smoothLevel,
                 show_polygon: true,
                 show_fill: true,
                 opacity: 0.4
             })
         });
+        if (
+            controller !== exportPreviewController
+            || projectId !== state.projectId
+            || imageIndex !== state.currentIndex
+        ) return;
         previewImage.src = data.preview;
         previewImage.style.display = 'block';
         if (placeholder) placeholder.style.display = 'none';
 
         const stats = data.stats;
-        const smoothNames = {none: '无平滑', low: '低', medium: '中等', high: '高', ultra: '超高'};
+        const smoothNames = {
+            none: '无平滑',
+            low: '低',
+            medium: '中等',
+            high: '高',
+            ultra: '超高'
+        };
         statsDiv.textContent =
             `文件: ${stats.filename} | 标注数: ${stats.total_annotations} | ` +
-            `平滑: ${smoothNames[stats.smooth_level]} | ` +
+            `平滑: ${smoothNames[stats.smooth_level] || '未知'} | ` +
             `尺寸: ${stats.image_size[0]}x${stats.image_size[1]}`;
         statsDiv.style.display = 'block';
     } catch (error) {
+        if (error.name === 'AbortError') return;
         showToast('错误', error.message, 'danger');
         if (placeholder) {
             placeholder.innerHTML = '<i class="bi bi-exclamation-triangle"></i><p>预览生成失败</p>';
             placeholder.style.display = 'block';
+        }
+    } finally {
+        if (controller === exportPreviewController) {
+            exportPreviewController = null;
         }
     }
 }
@@ -2512,67 +2658,6 @@ function updateExportPreview() {
     }
 }
 
-async function showSmoothCompare() {
-    if (!state.projectId) {
-        showToast('提示', '请先选择项目');
-        return;
-    }
-
-    // 获取当前图片的标注列表
-    const annotations = state.annotations || [];
-    if (annotations.length === 0) {
-        showToast('提示', '当前图片没有标注，无法对比');
-        return;
-    }
-
-    // 填充标注选择下拉框
-    const select = document.getElementById('compareAnnotationSelect');
-    select.innerHTML = annotations.map((ann, i) =>
-        `<option value="${i}">${i + 1}. ${ann.class_name || ann.label || '未命名'}</option>`
-    ).join('');
-
-    // 显示模态框
-    new bootstrap.Modal(document.getElementById('smoothCompareModal')).show();
-
-    // 生成对比预览
-    await updateSmoothCompare();
-}
-
-async function updateSmoothCompare() {
-    const annotationIndex = parseInt(document.getElementById('compareAnnotationSelect').value);
-    const loadingDiv = document.getElementById('smoothCompareLoading');
-    const gridDiv = document.getElementById('smoothCompareGrid');
-
-    // 显示加载状态
-    loadingDiv.style.display = 'block';
-    gridDiv.style.opacity = '0.3';
-
-    try {
-        const data = await apiRequest('/api/export/preview_compare', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                project_id: state.projectId,
-                image_index: state.currentIndex,
-                annotation_index: annotationIndex
-            })
-        });
-        const levels = ['none', 'low', 'medium', 'high', 'ultra'];
-        levels.forEach(level => {
-            const img = document.getElementById(`compare${level.charAt(0).toUpperCase() + level.slice(1)}`);
-            if (img && data.previews[level]) {
-                img.src = data.previews[level];
-            }
-        });
-        document.getElementById('compareNoneInfo').textContent = `原始: ${data.original_points} 点`;
-    } catch (error) {
-        showToast('错误', error.message, 'danger');
-    }
-
-    // 隐藏加载状态
-    loadingDiv.style.display = 'none';
-    gridDiv.style.opacity = '1';
-}
 
 // ==================== 图片放大查看器 ====================
 

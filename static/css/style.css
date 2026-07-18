@@ -373,6 +373,11 @@ body {
     padding: 0;
 }
 
+.image-list.is-loading {
+    pointer-events: none;
+    opacity: 0.65;
+}
+
 .image-item {
     height: 40px;
     padding: 0 16px;
@@ -711,6 +716,7 @@ body {
     box-shadow: 0 0 50px rgba(0, 0, 0, 0.8);
     border: 1px solid rgba(0, 240, 255, 0.1);
     flex-shrink: 0; /* 防止 canvas 被压缩 */
+    touch-action: none;
     /* 性能优化：提示浏览器进行硬件加速 */
     will-change: contents;
     transform: translateZ(0);
@@ -964,10 +970,18 @@ body {
     color: var(--danger);
     font-size: 14px;
     transition: var(--transition);
+    border: 0;
+    padding: 2px;
+    background: transparent;
 }
 
 .class-item:hover .delete-btn {
     opacity: 1;
+}
+
+.class-item .delete-btn:focus-visible {
+    opacity: 1;
+    outline: 1px solid var(--danger);
 }
 
 /* 标注列表 */
