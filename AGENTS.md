@@ -26,7 +26,7 @@ services/        exports/
    │                │
    ├─ AnnotationManager  →  data/projects.json + data/<id>/annotations.json
    │                        + data/<id>/image_annotations/<sha256>.json
-   │                        (threading.RLock, dirty-only 60s autosave, orjson)
+   │                        (schema-v3 manifests, per-image hydration, RLock, orjson)
    └─ SAM3Service  →  SAM_src/sam3 (sys.path.insert at import)
                         build_sam3_image_model(checkpoint_path='sam3.pt')
                         weights: sam3.pt at CWD (HF fallback: facebook/sam3)
@@ -105,15 +105,20 @@ only in its own dev extras — not wired for the app.
 - **Routing layout**: `app.py` is organized by `# ==================== <Section> API ====================` comment banners
   (Project / Image / SAM3 segment / Annotation / Classes / Export / Export preview / Video / AI translate / App exit).
   Add new routes under the matching banner.
-- **Exporters**: per-request instantiation; both `YOLOExporter` and `COCOExporter` expose `.export(...)` with
-  detect|segment mode and polygon smoothing. Pipeline: handlers build args → exporter.export() → return saved paths.
+- **Exporters**: per-request instantiation; both expose `.export(...)` with detect|segment mode and polygon
+  smoothing. They build in same-filesystem temporary directories, then replace only their owned output paths.
+  Re-exports remove stale files; pre-publish failures preserve the last complete dataset. Keep class union,
+  coordinate clamping, accurate exported-image counts, and COCO polygon-area semantics aligned.
 - **Naming**: snake_case throughout Python; Flask routes use `/api/<resource>/<action>` (e.g. `/api/project/<id>/update`).
 - **i18n**: docstrings and UI strings are **Chinese**; user-facing error messages are Chinese. Preserve when editing.
-- **Frontend**: vanilla JS in `static/js/annotation.js`, no framework/bundler. Extend the `state` object and use
-  `apiRequest()` for normal `/api/*` calls. Annotation saves are serialized and revision-checked; mutations must
-  call `recordAnnotationMutation()` to update bounded undo history, dirty state, and autosave. Canvas bitmaps stay
+- **Frontend**: vanilla JS in `static/js/annotation.js`, no framework/bundler. Extend `state` and use
+  `apiRequest()` for normal `/api/*` calls. Project routes return image manifests without annotation arrays;
+  `selectProject()`/`loadImage()` fetch `/api/annotation/get` in parallel with the bitmap and evict the previous
+  image's annotation cache. Annotation saves are serialized and revision-checked; mutations must call
+  `recordAnnotationMutation()` to update bounded undo history, dirty state, and autosave. Canvas bitmaps stay
   at source resolution while CSS applies zoom. The image sidebar is window-rendered, so never restore full-list
-  DOM rebuilding. Video page uses its own inline JS in `templates/video.html`.
+  DOM rebuilding. AI keys belong in `sessionStorage`, never persistent `localStorage`. Video remains separate
+  inline JS in `templates/video.html`.
 - **SAM3 source path hack**: `app.py` does `sys.path.insert(0, "SAM_src")` before importing SAM3 symbols. Any module needing SAM3 must rely on this side effect (or re-insert) — do not `pip install` the vendored package.
 - **Device selection (cross-platform)**: `services/sam3_service.py:_select_device()` picks CUDA > MPS (macOS Apple Silicon) > CPU at image-model init. `SAM_src/sam3/model_builder.py:_setup_device_and_mode()` uses `model.to(device)` for all devices. Force via `SAM3_DEVICE=cuda|mps|cpu` (unavailable requested devices fall back to CPU). Always construct `Sam3Processor(..., device=device)` explicitly — its upstream default is `"cuda"`.
 - **Vendored macOS patches — preserve on SAM3 updates**: `model/edt.py` guards unavailable macOS `triton`; `model_builder.py` uses device-agnostic `.to(device)`; `model/position_encoding.py` and `model/decoder.py` precompute caches on CPU then migrate once to the input device; `sam/transformer.py` invalidates RoPE cache on device mismatch; `model/geometry_encoders.py` avoids CUDA-only pinned-memory transfer semantics; `model/sam3_video_inference.py` disables CUDA autocast decorators when CUDA is unavailable. These are required for real MPS inference or clean macOS startup, not cosmetic changes.
@@ -124,7 +129,8 @@ only in its own dev extras — not wired for the app.
 - **Config**: `pyproject.toml` (deps, `requires-python = ">=3.11,<3.13"`), `uv.lock` (resolved versions),
   `.python-version` (uv Python pin), `requirements.txt` (legacy source list with platform markers), `.gitignore`.
   No settings module — env var `SAM3_DEVICE` (`cuda|mps|cpu`) can override the inference device in `sam3_service.py`.
-  AI-translate API config (key/url/model) is stored per-project in `data/`.
+  AI translation URL/model/enabled state is kept in browser `localStorage`; its API key is session-only
+  (`sessionStorage`) and HTTPS requests retain certificate verification.
 - **Model factory/checkpoint**: `SAM_src/sam3/model_builder.py` defaults to `checkpoint_path='sam3.pt'` at CWD. Verified checkpoint: 3,450,062,241 bytes, SHA-256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`; downloaded from public mirror `1038lab/sam3` because official `facebook/sam3` is gated. `*.pt` is gitignored.
 - **State files**: `data/projects.json` (registry), `data/<project_id>/annotations.json` (image/class manifest),
   and `data/<project_id>/image_annotations/<sha256(filename)>.json` (per-image annotations).
@@ -145,9 +151,10 @@ only in its own dev extras — not wired for the app.
 
 ## Testing & QA
 
-- **Project stability suite**: `tests/test_stability.py` uses stdlib `unittest` for schema-v2 migration,
-  per-image sidecar writes/recovery, lightweight project-list contracts, route envelopes/path validation,
-  singleton concurrency, and inference-error propagation. Run:
+- **Project stability suite**: `tests/test_stability.py` uses stdlib `unittest` for schema migration,
+  per-image sidecar writes/recovery, manifest hydration, route envelopes/path/JSON validation, TLS-preserving
+  AI requests, staged YOLO/COCO re-export behavior, COCO area/count correctness, singleton concurrency, and
+  inference-error propagation. Run:
   `uv run python -m unittest discover -s tests -p 'test_stability.py' -v`.
 - **Vendor tests**: `SAM_src/sam3/perflib/tests/tests.py` contains the upstream `TestMasksToBoxes`; a standalone
   `test_reindex_function()` exists in `SAM_src/sam3/eval/coco_reindex.py`.
@@ -155,6 +162,8 @@ only in its own dev extras — not wired for the app.
 - **Verification practice**: smoke-test changes by running `uv run python app.py` and exercising the affected
   `/api/*` route through the browser UI or a `curl` POST. Confirm the response envelope and that the registry,
   project manifest, and affected per-image sidecar update as expected.
-- **Verified macOS path (Apple M5)**: strict MPS text/point/box inference passes. Current browser smoke test created
-  a POSIX-path project, scanned and loaded the first image, rejected a legacy Windows path visibly, restored state after reload, returned one real cat detection through `/api/segment/text`, and confirmed the saved annotation through `/api/annotation/get`.
+- **Verified browser path (current)**: an isolated POSIX-path project loaded annotation manifests on demand,
+  navigated between annotated/unannotated images and rehydrated correctly, generated an export preview,
+  exported a real YOLO image/label pair, restored state after reload without page errors, and kept the AI key
+  out of persistent `localStorage`.
 - **Coverage**: not measured. Treat Flask route contracts, browser workflows, and `AnnotationManager` persistence as load-bearing verification surfaces.

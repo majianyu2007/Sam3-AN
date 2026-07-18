@@ -1678,8 +1678,10 @@ async function batchSegment() {
                             annotations
                         })
                     });
-                    state.images[imageIndex].annotations = annotations;
                     state.images[imageIndex].annotated = true;
+                    if (imageIndex === state.currentIndex) {
+                        state.annotations = structuredClone(annotations);
+                    }
                 }
                 totalDetections += newResults.length;
                 processed++;
@@ -2001,9 +2003,13 @@ async function selectProject(projectId) {
             Math.max(images.length - 1, 0)
         );
         let loadedImage = null;
+        let loadedAnnotations = [];
         if (images.length > 0) {
             setImageLoading(true, images[currentIndex], currentIndex, images.length);
-            loadedImage = await loadImageElement(images[currentIndex]);
+            [loadedImage, loadedAnnotations] = await Promise.all([
+                loadImageElement(images[currentIndex]),
+                loadImageAnnotations(projectId, currentIndex)
+            ]);
             if (
                 projectToken !== projectLoadToken
                 || navigationToken !== imageLoadToken
@@ -2016,9 +2022,7 @@ async function selectProject(projectId) {
         state.classes = project.classes || [];
         state.images = images;
         state.currentIndex = currentIndex;
-        state.annotations = structuredClone(
-            images[currentIndex]?.annotations || []
-        );
+        state.annotations = structuredClone(loadedAnnotations);
         state.tempPoints = [];
         state.tempBoxes = [];
         state.tempPolygon = [];
@@ -2180,6 +2184,12 @@ function loadImageElement(image) {
     });
 }
 
+function loadImageAnnotations(projectId, imageIndex) {
+    return apiRequest(
+        `/api/annotation/get?project_id=${encodeURIComponent(projectId)}&image_index=${imageIndex}`
+    ).then(data => data.annotations || []);
+}
+
 function setImageLoading(loading, image = null, index = 0, total = 0) {
     imageLoading = loading;
     const list = document.getElementById('imageList');
@@ -2220,11 +2230,18 @@ async function loadImage(index) {
     const image = state.images[index];
     setImageLoading(true, image, index, state.images.length);
     try {
-        const nextImage = await loadImageElement(image);
+        const previousIndex = state.currentIndex;
+        const [nextImage, annotations] = await Promise.all([
+            loadImageElement(image),
+            loadImageAnnotations(state.projectId, index)
+        ]);
         if (loadToken !== imageLoadToken) return false;
 
         state.currentIndex = index;
-        state.annotations = structuredClone(image.annotations || []);
+        state.annotations = structuredClone(annotations);
+        if (previousIndex !== index && state.images[previousIndex]) {
+            delete state.images[previousIndex].annotations;
+        }
         state.tempPoints = [];
         state.tempBoxes = [];
         state.tempPolygon = [];
@@ -2881,14 +2898,31 @@ const aiConfig = {
 // 初始化时加载AI配置
 function loadAIConfig() {
     const saved = localStorage.getItem('sam3_ai_config');
-    if (saved) {
-        try {
-            const config = JSON.parse(saved);
-            Object.assign(aiConfig, config);
-            updateAIConfigUI();
-        } catch (e) {
-            console.error('加载AI配置失败:', e);
+    if (!saved) {
+        aiConfig.apiKey = sessionStorage.getItem('sam3_ai_api_key') || '';
+        updateAIConfigUI();
+        return;
+    }
+    try {
+        const config = JSON.parse(saved);
+        aiConfig.enabled = Boolean(config.enabled);
+        aiConfig.apiUrl = String(config.apiUrl || '');
+        aiConfig.model = String(config.model || 'deepseek-chat');
+        aiConfig.apiKey =
+            sessionStorage.getItem('sam3_ai_api_key')
+            || String(config.apiKey || '');
+        if (config.apiKey) {
+            sessionStorage.setItem('sam3_ai_api_key', aiConfig.apiKey);
+            localStorage.setItem('sam3_ai_config', JSON.stringify({
+                enabled: aiConfig.enabled,
+                apiUrl: aiConfig.apiUrl,
+                model: aiConfig.model
+            }));
         }
+        updateAIConfigUI();
+    } catch (error) {
+        console.error('加载AI配置失败:', error);
+        localStorage.removeItem('sam3_ai_config');
     }
 }
 
@@ -2912,6 +2946,9 @@ function updateAIConfigUI() {
         if (aiConfig.enabled && aiConfig.apiUrl && aiConfig.apiKey) {
             statusText.textContent = '已启用';
             statusText.style.color = 'var(--success)';
+        } else if (aiConfig.apiUrl && !aiConfig.apiKey) {
+            statusText.textContent = '需输入本次会话密钥';
+            statusText.style.color = 'var(--warning)';
         } else if (aiConfig.apiUrl && aiConfig.apiKey) {
             statusText.textContent = '已配置但未启用';
             statusText.style.color = 'var(--warning)';
@@ -3001,7 +3038,12 @@ function saveAIConfig() {
         return;
     }
 
-    localStorage.setItem('sam3_ai_config', JSON.stringify(aiConfig));
+    sessionStorage.setItem('sam3_ai_api_key', aiConfig.apiKey);
+    localStorage.setItem('sam3_ai_config', JSON.stringify({
+        enabled: aiConfig.enabled,
+        apiUrl: aiConfig.apiUrl,
+        model: aiConfig.model
+    }));
     updateAIConfigUI();
 
     bootstrap.Modal.getInstance(document.getElementById('aiConfigModal')).hide();
@@ -3017,7 +3059,7 @@ function saveAIConfig() {
 async function clearAIConfig() {
     if (!(await confirmAction({
         title: '清除 AI 配置',
-        message: '确定要清除保存的 API 地址、密钥和模型配置吗？',
+        message: '确定要清除保存的 API 地址、会话密钥和模型配置吗？',
         confirmText: '清除',
         danger: true
     }))) return;
@@ -3026,15 +3068,14 @@ async function clearAIConfig() {
     aiConfig.apiUrl = '';
     aiConfig.apiKey = '';
     aiConfig.model = 'deepseek-chat';
-
     localStorage.removeItem('sam3_ai_config');
+    sessionStorage.removeItem('sam3_ai_api_key');
 
     document.getElementById('aiApiUrl').value = '';
     document.getElementById('aiApiKey').value = '';
     document.getElementById('aiModel').value = 'deepseek-chat';
     document.getElementById('aiTranslateEnabled').checked = false;
     document.getElementById('aiTestResult').style.display = 'none';
-
     updateAIConfigUI();
     showToast('成功', 'AI配置已清除');
 }

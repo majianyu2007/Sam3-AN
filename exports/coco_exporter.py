@@ -5,6 +5,8 @@ COCO格式导出器
 import os
 import json
 import shutil
+import tempfile
+import math
 from pathlib import Path
 from datetime import datetime
 from PIL import Image, ImageOps
@@ -94,76 +96,90 @@ class COCOExporter:
                export_type: str = 'segment',
                split_ratio: tuple = (0.8, 0.1, 0.1),
                smooth_level: str = 'medium') -> dict:
-        """
-        导出为COCO格式
-
-        Args:
-            project: 项目数据
-            output_dir: 输出目录
-            export_type: 'detect' 仅边界框 或 'segment' 实例分割
-            split_ratio: (train, val, test) 比例
-            smooth_level: 多边形平滑级别 'none', 'low', 'medium', 'high', 'ultra'
-
-        Returns:
-            导出结果统计
-        """
+        """以暂存目录生成 COCO 数据集，成功后替换既有导出。"""
+        if export_type not in {'detect', 'segment'}:
+            raise ValueError("COCO 导出类型必须是 detect 或 segment")
+        if smooth_level not in self.smooth_params:
+            raise ValueError("平滑级别无效")
+        if (
+            len(split_ratio) != 3
+            or any(ratio < 0 for ratio in split_ratio)
+            or sum(split_ratio) <= 0
+        ):
+            raise ValueError("数据集拆分比例无效")
         self.current_smooth_level = smooth_level
         self.export_type = export_type
         output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        # 创建目录结构
-        for split in ['train', 'val', 'test']:
-            (output_path / split).mkdir(exist_ok=True)
-
-        annotations_dir = output_path / 'annotations'
-        annotations_dir.mkdir(exist_ok=True)
-
-        # 获取类别
-        classes = project.get('classes', [])
-        if not classes:
-            classes = self._extract_classes(project)
-
-        # 分割数据集
-        images = [img for img in project.get('images', []) if img.get('annotated', False)]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        classes = self._resolve_classes(project)
+        images = [
+            image
+            for image in project.get('images', [])
+            if image.get('annotations')
+        ]
+        filenames = [str(image.get('filename') or '') for image in images]
+        if len(filenames) != len(set(filenames)):
+            raise ValueError("项目中存在重复图片文件名")
         train_end = int(len(images) * split_ratio[0])
         val_end = train_end + int(len(images) * split_ratio[1])
-
         splits = {
             'train': images[:train_end],
             'val': images[train_end:val_end],
-            'test': images[val_end:]
+            'test': images[val_end:],
         }
-
         stats = {'train': 0, 'val': 0, 'test': 0, 'total_annotations': 0}
 
-        for split_name, split_images in splits.items():
-            coco_data = self._create_coco_structure(project, classes)
-            ann_count = self._export_split(
-                split_images, output_path, split_name, coco_data, classes, export_type
-            )
-
-            # 保存COCO JSON
-            json_path = annotations_dir / f'instances_{split_name}.json'
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(coco_data, f, ensure_ascii=False, indent=2)
-
-            stats[split_name] = len(split_images)
-            stats['total_annotations'] += ann_count
+        with tempfile.TemporaryDirectory(
+            prefix='.sam3-coco-',
+            dir=output_path.parent,
+        ) as temporary_dir:
+            staging_path = Path(temporary_dir)
+            for split in ('train', 'val', 'test'):
+                (staging_path / split).mkdir()
+            annotations_path = staging_path / 'annotations'
+            annotations_path.mkdir()
+            for split_name, split_images in splits.items():
+                coco_data = self._create_coco_structure(project, classes)
+                image_count, annotation_count = self._export_split(
+                    split_images,
+                    staging_path,
+                    split_name,
+                    coco_data,
+                    classes,
+                    export_type,
+                )
+                with (
+                    annotations_path / f'instances_{split_name}.json'
+                ).open('w', encoding='utf-8') as file:
+                    json.dump(coco_data, file, ensure_ascii=False, indent=2)
+                stats[split_name] = image_count
+                stats['total_annotations'] += annotation_count
+            self._publish(staging_path, output_path)
 
         stats['classes'] = classes
         stats['output_dir'] = str(output_path)
-
         return stats
 
-    def _extract_classes(self, project: dict) -> list:
-        """从标注中提取类别"""
-        classes = set()
-        for img in project.get('images', []):
-            for ann in img.get('annotations', []):
-                class_name = ann.get('class_name') or ann.get('label', 'object')
-                classes.add(class_name)
-        return sorted(list(classes))
+    def _resolve_classes(self, project: dict) -> list:
+        """保留项目类别顺序，并补入仍被标注引用的类别。"""
+        classes = []
+        seen = set()
+        for class_name in project.get('classes', []):
+            class_name = str(class_name).strip()
+            if class_name and class_name not in seen:
+                seen.add(class_name)
+                classes.append(class_name)
+        for image in project.get('images', []):
+            for annotation in image.get('annotations', []):
+                class_name = str(
+                    annotation.get('class_name')
+                    or annotation.get('label')
+                    or 'object'
+                ).strip()
+                if class_name and class_name not in seen:
+                    seen.add(class_name)
+                    classes.append(class_name)
+        return classes
 
     def _create_coco_structure(self, project: dict, classes: list) -> dict:
         """创建COCO基础结构"""
@@ -189,88 +205,157 @@ class COCOExporter:
             'annotations': []
         }
 
+    @staticmethod
+    def _clamp_polygon(polygon: list, image_width: int, image_height: int) -> list:
+        """将不可信多边形限制到图片边界，避免异常尺寸的 mask 分配。"""
+        if not isinstance(polygon, list):
+            return []
+        points = []
+        for point in polygon:
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                return []
+            try:
+                x, y = float(point[0]), float(point[1])
+            except (TypeError, ValueError):
+                return []
+            if not math.isfinite(x) or not math.isfinite(y):
+                return []
+            points.append([
+                min(max(x, 0.0), float(image_width)),
+                min(max(y, 0.0), float(image_height)),
+            ])
+        return points
+
     def _export_split(self, images: list, output_path: Path,
                       split: str, coco_data: dict, classes: list,
-                      export_type: str = 'segment') -> int:
-        """导出单个数据集分割"""
-        class_to_id = {cls: i + 1 for i, cls in enumerate(classes)}
+                      export_type: str = 'segment') -> tuple[int, int]:
+        """导出单个数据集分割，并返回实际图片和标注数量。"""
+        class_to_id = {
+            class_name: index + 1
+            for index, class_name in enumerate(classes)
+        }
         annotation_id = 1
+        exported_images = 0
         total_annotations = 0
 
-        for img_idx, img_info in enumerate(images):
+        for img_info in images:
             src_path = img_info.get('path')
-            if not src_path or not os.path.exists(src_path):
+            if not src_path or not os.path.isfile(src_path):
                 continue
-
-            filename = img_info.get('filename')
-            image_id = img_idx + 1
-
-            # 复制图片
-            dst_path = output_path / split / filename
-            shutil.copy2(src_path, dst_path)
-
-            # 获取图片信息
-            with Image.open(src_path) as img:
-                # 处理 EXIF 旋转信息
-                img = ImageOps.exif_transpose(img)
-                img_width, img_height = img.size
-
-            # 添加图片信息
+            filename = str(img_info.get('filename') or '')
+            if not filename or Path(filename).name != filename:
+                raise ValueError(f"图片文件名无效: {filename!r}")
+            with Image.open(src_path) as source:
+                image = ImageOps.exif_transpose(source)
+                image_width, image_height = image.size
+            if image_width <= 0 or image_height <= 0:
+                continue
+            image_id = exported_images + 1
+            shutil.copy2(src_path, output_path / split / filename)
             coco_data['images'].append({
                 'id': image_id,
                 'file_name': filename,
-                'width': img_width,
-                'height': img_height,
-                'license': 1
+                'width': image_width,
+                'height': image_height,
+                'license': 1,
             })
+            exported_images += 1
 
-            # 添加标注
-            for ann in img_info.get('annotations', []):
-                class_name = ann.get('class_name') or ann.get('label', 'object')
-                category_id = class_to_id.get(class_name, 1)
-
-                coco_ann = {
+            for annotation in img_info.get('annotations', []):
+                class_name = str(
+                    annotation.get('class_name')
+                    or annotation.get('label')
+                    or 'object'
+                ).strip()
+                coco_annotation = {
                     'id': annotation_id,
                     'image_id': image_id,
-                    'category_id': category_id,
-                    'iscrowd': 0
+                    'category_id': class_to_id[class_name],
+                    'iscrowd': 0,
                 }
-
-                # 根据导出类型处理分割或检测
-                if export_type == 'segment' and ann.get('polygon'):
-                    # 分割格式：包含完整多边形轮廓
-                    polygon = ann['polygon']
-                    if len(polygon) >= 3:
-                        # 应用平滑处理
-                        smoothed_polygon = self.smooth_polygon(polygon, self.current_smooth_level)
-                        # 转换为COCO格式 [x1, y1, x2, y2, ...]
-                        segmentation = []
-                        for point in smoothed_polygon:
-                            segmentation.extend([float(point[0]), float(point[1])])
-                        coco_ann['segmentation'] = [segmentation]
-
-                        # 计算bbox
-                        xs = [p[0] for p in polygon]
-                        ys = [p[1] for p in polygon]
-                        x_min, x_max = min(xs), max(xs)
-                        y_min, y_max = min(ys), max(ys)
-                        coco_ann['bbox'] = [x_min, y_min, x_max - x_min, y_max - y_min]
-                        coco_ann['area'] = (x_max - x_min) * (y_max - y_min)
-                    else:
+                if export_type == 'segment' and annotation.get('polygon'):
+                    polygon = self._clamp_polygon(
+                        annotation['polygon'],
+                        image_width,
+                        image_height,
+                    )
+                    if len(polygon) < 3:
                         continue
+                    smoothed = self.smooth_polygon(
+                        polygon,
+                        self.current_smooth_level,
+                    )
+                    if len(smoothed) < 3:
+                        continue
+                    points = [
+                        [
+                            min(max(float(point[0]), 0.0), float(image_width)),
+                            min(max(float(point[1]), 0.0), float(image_height)),
+                        ]
+                        for point in smoothed
+                    ]
+                    segmentation = [
+                        coordinate
+                        for point in points
+                        for coordinate in point
+                    ]
+                    x_values = [point[0] for point in points]
+                    y_values = [point[1] for point in points]
+                    x_min, x_max = min(x_values), max(x_values)
+                    y_min, y_max = min(y_values), max(y_values)
+                    area = abs(sum(
+                        point[0] * points[(index + 1) % len(points)][1]
+                        - points[(index + 1) % len(points)][0] * point[1]
+                        for index, point in enumerate(points)
+                    )) / 2
+                    if area <= 0:
+                        continue
+                    coco_annotation['segmentation'] = [segmentation]
+                    coco_annotation['bbox'] = [
+                        x_min,
+                        y_min,
+                        x_max - x_min,
+                        y_max - y_min,
+                    ]
+                    coco_annotation['area'] = area
                 else:
-                    # 检测格式：仅包含边界框
-                    bbox = ann.get('bbox')
-                    if bbox and len(bbox) >= 4:
-                        x1, y1, x2, y2 = bbox[:4]
-                        coco_ann['bbox'] = [x1, y1, x2 - x1, y2 - y1]
-                        coco_ann['area'] = (x2 - x1) * (y2 - y1)
-                        coco_ann['segmentation'] = []
-                    else:
+                    bbox = annotation.get('bbox')
+                    if not bbox or len(bbox) < 4:
                         continue
-
-                coco_data['annotations'].append(coco_ann)
+                    x1, y1, x2, y2 = (float(value) for value in bbox[:4])
+                    if not all(
+                        math.isfinite(value)
+                        for value in (x1, y1, x2, y2)
+                    ):
+                        raise ValueError(
+                            f"图片 {filename} 包含非有限边界框坐标"
+                        )
+                    x1 = min(max(x1, 0.0), float(image_width))
+                    x2 = min(max(x2, 0.0), float(image_width))
+                    y1 = min(max(y1, 0.0), float(image_height))
+                    y2 = min(max(y2, 0.0), float(image_height))
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    coco_annotation['bbox'] = [
+                        x1,
+                        y1,
+                        x2 - x1,
+                        y2 - y1,
+                    ]
+                    coco_annotation['area'] = (x2 - x1) * (y2 - y1)
+                    coco_annotation['segmentation'] = []
+                coco_data['annotations'].append(coco_annotation)
                 annotation_id += 1
                 total_annotations += 1
+        return exported_images, total_annotations
 
-        return total_annotations
+    @staticmethod
+    def _publish(staging_path: Path, output_path: Path):
+        output_path.mkdir(parents=True, exist_ok=True)
+        for name in ('train', 'val', 'test', 'annotations'):
+            destination = output_path / name
+            if destination.is_dir():
+                shutil.rmtree(destination)
+            elif destination.exists():
+                destination.unlink()
+            os.replace(staging_path / name, destination)

@@ -1,5 +1,7 @@
 import os
 import shutil
+import tempfile
+import math
 from pathlib import Path
 from PIL import Image, ImageOps
 import yaml
@@ -116,155 +118,221 @@ class YOLOExporter:
                format_type: str = 'segment',
                split_ratio: tuple = (0.8, 0.1, 0.1),
                smooth_level: str = 'medium') -> dict:
-        """
-        导出为YOLO格式
-
-        Args:
-            project: 项目数据
-            output_dir: 输出目录
-            format_type: 'detect' 或 'segment'
-            split_ratio: (train, val, test) 比例
-            smooth_level: 多边形平滑级别 'none', 'low', 'medium', 'high', 'ultra'
-
-        Returns:
-            导出结果统计
-        """
+        """以暂存目录生成 YOLO 数据集，成功后替换既有导出。"""
+        if format_type not in {'detect', 'segment'}:
+            raise ValueError("YOLO 导出类型必须是 detect 或 segment")
+        if smooth_level not in self.smooth_params:
+            raise ValueError("平滑级别无效")
+        if (
+            len(split_ratio) != 3
+            or any(ratio < 0 for ratio in split_ratio)
+            or sum(split_ratio) <= 0
+        ):
+            raise ValueError("数据集拆分比例无效")
         self.current_smooth_level = smooth_level
-        self.format_type = format_type  # 保存导出类型
+        self.format_type = format_type
         output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        # 创建目录结构
-        for split in ['train', 'val', 'test']:
-            (output_path / 'images' / split).mkdir(parents=True, exist_ok=True)
-            (output_path / 'labels' / split).mkdir(parents=True, exist_ok=True)
-
-        # 获取类别映射
-        classes = project.get('classes', [])
-        if not classes:
-            # 从标注中提取类别
-            classes = self._extract_classes(project)
-
-        class_to_id = {cls: i for i, cls in enumerate(classes)}
-
-        # 分割数据集
-        images = [img for img in project.get('images', []) if img.get('annotated', False)]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        classes = self._resolve_classes(project)
+        class_to_id = {class_name: index for index, class_name in enumerate(classes)}
+        images = [
+            image
+            for image in project.get('images', [])
+            if image.get('annotations')
+        ]
+        stems = [Path(str(image.get('filename', ''))).stem for image in images]
+        if len(stems) != len(set(stems)):
+            raise ValueError("存在同名但扩展名不同的图片，YOLO 标签文件会冲突")
         train_end = int(len(images) * split_ratio[0])
         val_end = train_end + int(len(images) * split_ratio[1])
-
         splits = {
             'train': images[:train_end],
             'val': images[train_end:val_end],
-            'test': images[val_end:]
+            'test': images[val_end:],
         }
-
         stats = {'train': 0, 'val': 0, 'test': 0, 'total_annotations': 0}
 
-        for split_name, split_images in splits.items():
-            for img_info in split_images:
-                result = self._export_image(
-                    img_info, output_path, split_name,
-                    class_to_id
-                )
-                if result:
-                    stats[split_name] += 1
-                    stats['total_annotations'] += result
-
-        # 生成data.yaml
-        self._generate_yaml(output_path, classes, project.get('name', 'dataset'))
+        with tempfile.TemporaryDirectory(
+            prefix='.sam3-yolo-',
+            dir=output_path.parent,
+        ) as temporary_dir:
+            staging_path = Path(temporary_dir)
+            for split in ('train', 'val', 'test'):
+                (staging_path / 'images' / split).mkdir(parents=True)
+                (staging_path / 'labels' / split).mkdir(parents=True)
+            for split_name, split_images in splits.items():
+                for image in split_images:
+                    annotation_count = self._export_image(
+                        image,
+                        staging_path,
+                        split_name,
+                        class_to_id,
+                    )
+                    if annotation_count:
+                        stats[split_name] += 1
+                        stats['total_annotations'] += annotation_count
+            self._generate_yaml(
+                staging_path,
+                classes,
+                project.get('name', 'dataset'),
+                output_path,
+            )
+            self._publish(staging_path, output_path)
 
         stats['classes'] = classes
         stats['output_dir'] = str(output_path)
-
         return stats
 
-    def _extract_classes(self, project: dict) -> list:
-        """从标注中提取类别"""
-        classes = set()
-        for img in project.get('images', []):
-            for ann in img.get('annotations', []):
-                class_name = ann.get('class_name') or ann.get('label', 'object')
-                classes.add(class_name)
-        return sorted(list(classes))
+    def _resolve_classes(self, project: dict) -> list:
+        """保留项目类别顺序，并补入仍被标注引用的类别。"""
+        classes = []
+        seen = set()
+        for class_name in project.get('classes', []):
+            class_name = str(class_name).strip()
+            if class_name and class_name not in seen:
+                seen.add(class_name)
+                classes.append(class_name)
+        for image in project.get('images', []):
+            for annotation in image.get('annotations', []):
+                class_name = str(
+                    annotation.get('class_name')
+                    or annotation.get('label')
+                    or 'object'
+                ).strip()
+                if class_name and class_name not in seen:
+                    seen.add(class_name)
+                    classes.append(class_name)
+        return classes
+
+    @staticmethod
+    def clamp_polygon(polygon: list, image_width: int, image_height: int) -> list:
+        """将不可信多边形限制到图片边界，避免异常尺寸的 mask 分配。"""
+        if not isinstance(polygon, list):
+            return []
+        points = []
+        for point in polygon:
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                return []
+            try:
+                x, y = float(point[0]), float(point[1])
+            except (TypeError, ValueError):
+                return []
+            if not math.isfinite(x) or not math.isfinite(y):
+                return []
+            points.append([
+                min(max(x, 0.0), float(image_width)),
+                min(max(y, 0.0), float(image_height)),
+            ])
+        return points
 
     def _export_image(self, img_info: dict, output_path: Path,
                       split: str, class_to_id: dict) -> int:
-        """导出单张图片"""
+        """导出一张至少含一个有效标签的图片。"""
         src_path = img_info.get('path')
-        if not src_path or not os.path.exists(src_path):
+        if not src_path or not os.path.isfile(src_path):
+            return 0
+        filename = str(img_info.get('filename') or '')
+        if not filename or Path(filename).name != filename:
+            raise ValueError(f"图片文件名无效: {filename!r}")
+        with Image.open(src_path) as source:
+            image = ImageOps.exif_transpose(source)
+            image_width, image_height = image.size
+        if image_width <= 0 or image_height <= 0:
             return 0
 
-        filename = img_info.get('filename')
-        name_without_ext = Path(filename).stem
-
-        # 复制图片
-        dst_image = output_path / 'images' / split / filename
-        shutil.copy2(src_path, dst_image)
-
-        # 获取图片尺寸
-        with Image.open(src_path) as img:
-            # 处理 EXIF 旋转信息
-            img = ImageOps.exif_transpose(img)
-            img_width, img_height = img.size
-
-        # 生成标签文件
-        annotations = img_info.get('annotations', [])
-        if not annotations:
-            return 0
-
-        label_file = output_path / 'labels' / split / f"{name_without_ext}.txt"
         lines = []
+        for annotation in img_info.get('annotations', []):
+            class_name = str(
+                annotation.get('class_name')
+                or annotation.get('label')
+                or 'object'
+            ).strip()
+            class_id = class_to_id[class_name]
+            if self.format_type == 'segment' and annotation.get('polygon'):
+                polygon = self.clamp_polygon(
+                    annotation['polygon'],
+                    image_width,
+                    image_height,
+                )
+                if len(polygon) < 3:
+                    continue
+                smoothed = self.smooth_polygon(
+                    polygon,
+                    self.current_smooth_level,
+                )
+                if len(smoothed) < 3:
+                    continue
+                coordinates = []
+                for point in smoothed:
+                    x = min(max(float(point[0]) / image_width, 0.0), 1.0)
+                    y = min(max(float(point[1]) / image_height, 0.0), 1.0)
+                    coordinates.extend([f"{x:.6f}", f"{y:.6f}"])
+                lines.append(f"{class_id} " + " ".join(coordinates))
+                continue
 
-        for ann in annotations:
-            class_name = ann.get('class_name') or ann.get('label', 'object')
-            class_id = class_to_id.get(class_name, 0)
-
-            if self.format_type == 'segment' and ann.get('polygon'):
-                # 分割格式: class_id x1 y1 x2 y2 ... xn yn (归一化)
-                polygon = ann['polygon']
-                if len(polygon) >= 3:
-                    # 应用平滑处理
-                    smoothed_polygon = self.smooth_polygon(polygon, self.current_smooth_level)
-                    coords = []
-                    for point in smoothed_polygon:
-                        x_norm = point[0] / img_width
-                        y_norm = point[1] / img_height
-                        coords.extend([f"{x_norm:.6f}", f"{y_norm:.6f}"])
-                    line = f"{class_id} " + " ".join(coords)
-                    lines.append(line)
-            else:
-                # 检测格式: class_id x_center y_center width height (归一化)
-                bbox = ann.get('bbox', [])
-                if len(bbox) >= 4:
-                    x1, y1, x2, y2 = bbox[:4]
-                    x_center = (x1 + x2) / 2 / img_width
-                    y_center = (y1 + y2) / 2 / img_height
-                    width = (x2 - x1) / img_width
-                    height = (y2 - y1) / img_height
-                    line = f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
-                    lines.append(line)
-
-        with open(label_file, 'w') as f:
-            f.write('\n'.join(lines))
-
+            bbox = annotation.get('bbox', [])
+            if len(bbox) < 4:
+                continue
+            x1, y1, x2, y2 = (float(value) for value in bbox[:4])
+            if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
+                raise ValueError(f"图片 {filename} 包含非有限边界框坐标")
+            x1 = min(max(x1, 0.0), float(image_width))
+            x2 = min(max(x2, 0.0), float(image_width))
+            y1 = min(max(y1, 0.0), float(image_height))
+            y2 = min(max(y2, 0.0), float(image_height))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            x_center = (x1 + x2) / 2 / image_width
+            y_center = (y1 + y2) / 2 / image_height
+            width = (x2 - x1) / image_width
+            height = (y2 - y1) / image_height
+            lines.append(
+                f"{class_id} {x_center:.6f} {y_center:.6f} "
+                f"{width:.6f} {height:.6f}"
+            )
+        if not lines:
+            return 0
+        label_path = output_path / 'labels' / split / f"{Path(filename).stem}.txt"
+        label_path.write_text('\n'.join(lines), encoding='utf-8')
+        shutil.copy2(src_path, output_path / 'images' / split / filename)
         return len(lines)
 
-    def _generate_yaml(self, output_path: Path, classes: list, dataset_name: str):
-        """生成YOLO data.yaml配置文件"""
+    def _generate_yaml(
+        self,
+        output_path: Path,
+        classes: list,
+        dataset_name: str,
+        dataset_root: Path,
+    ):
+        """生成引用最终目录的 YOLO 配置。"""
         data = {
-            'path': str(output_path.absolute()),
+            'path': str(dataset_root.absolute()),
             'train': 'images/train',
             'val': 'images/val',
             'test': 'images/test',
-            'names': {i: name for i, name in enumerate(classes)},
-            'nc': len(classes)
+            'names': {index: name for index, name in enumerate(classes)},
+            'nc': len(classes),
         }
+        with (output_path / 'data.yaml').open('w', encoding='utf-8') as file:
+            yaml.safe_dump(
+                data,
+                file,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+            )
+        (output_path / 'classes.txt').write_text(
+            '\n'.join(classes),
+            encoding='utf-8',
+        )
 
-        yaml_path = output_path / 'data.yaml'
-        with open(yaml_path, 'w', encoding='utf-8') as f:
-            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
-
-        # 同时生成classes.txt
-        classes_path = output_path / 'classes.txt'
-        with open(classes_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(classes))
+    @staticmethod
+    def _publish(staging_path: Path, output_path: Path):
+        output_path.mkdir(parents=True, exist_ok=True)
+        for name in ('images', 'labels', 'data.yaml', 'classes.txt'):
+            destination = output_path / name
+            if destination.is_dir():
+                shutil.rmtree(destination)
+            elif destination.exists():
+                destination.unlink()
+            os.replace(staging_path / name, destination)

@@ -11,6 +11,8 @@ from PIL import Image
 import app as app_module
 from services.annotation_manager import AnnotationManager
 from services.sam3_service import SAM3Service
+from exports.coco_exporter import COCOExporter
+from exports.yolo_exporter import YOLOExporter
 
 
 # app.py creates a production manager at import time. Prevent the test interpreter's
@@ -264,6 +266,18 @@ class FlaskContractTests(unittest.TestCase):
         self.assertEqual(summary["image_count"], 1)
         self.assertEqual(summary["annotated_count"], 1)
 
+        project_detail = self.client.get(f"/api/project/{project['id']}")
+        manifest_image = project_detail.get_json()["project"]["images"][0]
+        self.assertNotIn("annotations", manifest_image)
+        annotations = self.client.get(
+            "/api/annotation/get",
+            query_string={
+                "project_id": project["id"],
+                "image_index": 0,
+            },
+        )
+        self.assertEqual(annotations.get_json()["annotations"][0]["id"], "a1")
+
         invalid = self.client.post(
             "/api/annotation/save",
             json={
@@ -274,6 +288,50 @@ class FlaskContractTests(unittest.TestCase):
         )
         self.assertEqual(invalid.status_code, 400)
         self.assertFalse(invalid.get_json()["success"])
+
+    def test_malformed_json_always_returns_json_error(self):
+        for route in (
+            "/api/export/preview",
+            "/api/export/preview_compare",
+            "/api/video/start_session",
+            "/api/video/add_prompt",
+            "/api/video/propagate",
+            "/api/video/close_session",
+            "/api/ai/translate",
+            "/api/ai/test",
+        ):
+            with self.subTest(route=route):
+                response = self.client.post(
+                    route,
+                    data="null",
+                    content_type="application/json",
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertTrue(response.is_json)
+                self.assertFalse(response.get_json()["success"])
+
+    def test_ai_requests_keep_tls_verification_enabled(self):
+        remote = unittest.mock.Mock(status_code=200)
+        remote.json.return_value = {
+            "choices": [{"message": {"content": "cat"}}],
+        }
+        with patch.object(app_module.requests, "post", return_value=remote) as post:
+            response = self.client.post(
+                "/api/ai/translate",
+                json={
+                    "text": "猫",
+                    "api_url": "https://example.com",
+                    "api_key": "secret",
+                    "model": "model",
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["translated"], "cat")
+        self.assertNotIn("verify", post.call_args.kwargs)
+        self.assertEqual(
+            post.call_args.args[0],
+            "https://example.com/v1/chat/completions",
+        )
 
     def test_windows_path_is_rejected_with_json_error(self):
         response = self.client.post(
@@ -319,6 +377,101 @@ class FlaskContractTests(unittest.TestCase):
             )
         self.assertEqual(picker.status_code, 200)
         self.assertTrue(picker.get_json()["canceled"])
+
+
+class ExporterContractTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.source = self.root / "source"
+        self.source.mkdir()
+        for filename in ("one.png", "two.png"):
+            Image.new("RGB", (20, 20), "white").save(self.source / filename)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def image_record(self, filename, polygon=None):
+        return {
+            "filename": filename,
+            "path": str(self.source / filename),
+            "annotated": True,
+            "annotations": [{
+                "id": f"annotation-{filename}",
+                "class_name": "legacy",
+                "polygon": polygon or [[1, 1], [18, 1], [18, 18], [1, 18]],
+                "bbox": [1, 1, 18, 18],
+            }],
+        }
+
+    def test_yolo_reexport_removes_stale_files_and_preserves_old_on_failure(self):
+        output = self.root / "yolo"
+        exporter = YOLOExporter()
+        project = {
+            "name": "dataset",
+            "classes": ["configured"],
+            "images": [
+                self.image_record("one.png"),
+                self.image_record("two.png"),
+            ],
+        }
+        exporter.export(project, str(output), smooth_level="none")
+        result = exporter.export(
+            {**project, "images": [self.image_record("one.png")]},
+            str(output),
+            smooth_level="none",
+        )
+        self.assertEqual(result["classes"], ["configured", "legacy"])
+        self.assertFalse(any(
+            "two" in path.name
+            for path in output.rglob("*")
+            if path.is_file()
+        ))
+        label = next((output / "labels").rglob("one.txt"))
+        self.assertTrue(label.read_text().startswith("1 "))
+
+        invalid = {
+            **project,
+            "images": [{
+                **self.image_record("one.png"),
+                "filename": "../escape.png",
+            }],
+        }
+        with self.assertRaisesRegex(ValueError, "文件名无效"):
+            exporter.export(invalid, str(output), smooth_level="none")
+        self.assertTrue(label.is_file())
+
+    def test_coco_uses_polygon_area_and_actual_export_counts(self):
+        output = self.root / "coco"
+        project = {
+            "name": "dataset",
+            "classes": ["configured"],
+            "images": [
+                self.image_record(
+                    "one.png",
+                    polygon=[[0, 0], [10, 0], [0, 10]],
+                ),
+                {
+                    **self.image_record("two.png"),
+                    "path": str(self.source / "missing.png"),
+                },
+            ],
+        }
+        result = COCOExporter().export(
+            project,
+            str(output),
+            smooth_level="none",
+        )
+        self.assertEqual(sum(result[split] for split in ("train", "val", "test")), 1)
+        self.assertEqual(result["total_annotations"], 1)
+        annotation_files = list((output / "annotations").glob("instances_*.json"))
+        exported = [
+            annotation
+            for path in annotation_files
+            for annotation in json.loads(path.read_text())["annotations"]
+        ]
+        self.assertEqual(exported[0]["area"], 50.0)
+        self.assertEqual(result["classes"], ["configured", "legacy"])
 
 
 class ServiceConcurrencyTests(unittest.TestCase):

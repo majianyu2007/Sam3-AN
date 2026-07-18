@@ -66,7 +66,7 @@ class SAM3Service:
 
     def _init_image_model(self):
         """初始化图像分割模型"""
-        if self.image_model is not None:
+        if self.image_model is not None and self.image_processor is not None:
             return
 
         print("正在加载SAM3图像模型...")
@@ -84,11 +84,13 @@ class SAM3Service:
         print(f"[INFO] 使用设备: {self.device}")
 
         bpe_path = sam3_src / "assets" / "bpe_simple_vocab_16e6.txt.gz"
-        self.image_model = build_sam3_image_model(
+        image_model = build_sam3_image_model(
             bpe_path=str(bpe_path),
             device=self.device,
         )
-        self.image_processor = Sam3Processor(self.image_model, device=self.device)
+        image_processor = Sam3Processor(image_model, device=self.device)
+        self.image_model = image_model
+        self.image_processor = image_processor
 
         print("SAM3图像模型加载完成")
 
@@ -96,10 +98,9 @@ class SAM3Service:
         """加载图像"""
         if self.current_image_path != image_path or self.inference_state is None:
             print(f"[DEBUG] 加载图像: {image_path}")
-            image = Image.open(image_path)
-            # 处理 EXIF 旋转信息，修复竖屏图像分割偏移问题
-            image = ImageOps.exif_transpose(image)
-            image = image.convert('RGB')
+            with Image.open(image_path) as source:
+                # 处理 EXIF 旋转信息，修复竖屏图像分割偏移问题
+                image = ImageOps.exif_transpose(source).convert('RGB')
             self._image_size = image.size
             self.inference_state = self.image_processor.set_image(image)
             self.current_image_path = image_path
@@ -577,6 +578,11 @@ class SAM3Service:
         self.video_predictor = build_sam3_video_predictor(gpus_to_use=gpus)
         print("SAM3视频模型加载完成")
 
+    def _require_video_session(self, session_id: str):
+        if session_id not in self.video_sessions:
+            raise ValueError(f"视频会话不存在: {session_id}")
+
+    @_serialized_inference
     def start_video_session(self, video_path: str) -> str:
         self._init_video_model()
         response = self.video_predictor.handle_request(
@@ -586,10 +592,11 @@ class SAM3Service:
         self.video_sessions[session_id] = {'video_path': video_path, 'outputs': {}}
         return session_id
 
+    @_serialized_inference
     def add_video_prompt(self, session_id: str, frame_index: int,
                          prompt_type: str, prompt_data) -> dict:
+        self._require_video_session(session_id)
         self._init_video_model()
-
         request = {
             'type': 'add_prompt',
             'session_id': session_id,
@@ -597,19 +604,34 @@ class SAM3Service:
         }
 
         if prompt_type == 'text':
-            request['text'] = prompt_data
+            text = str(prompt_data or '').strip()
+            if not text:
+                raise ValueError("文本提示不能为空")
+            request['text'] = text
         elif prompt_type == 'points':
-            points = torch.tensor(prompt_data['points'], dtype=torch.float32)
-            labels = torch.tensor(prompt_data['labels'], dtype=torch.int32)
-            request['points'] = points
-            request['point_labels'] = labels
+            if not isinstance(prompt_data, dict):
+                raise ValueError("点击提示数据必须是对象")
+            points = prompt_data.get('points')
+            labels = prompt_data.get('labels')
+            if (
+                not isinstance(points, list)
+                or not isinstance(labels, list)
+                or not points
+                or len(points) != len(labels)
+            ):
+                raise ValueError("点击提示的 points 和 labels 无效")
+            request['points'] = torch.tensor(points, dtype=torch.float32)
+            request['point_labels'] = torch.tensor(labels, dtype=torch.int32)
             if 'obj_id' in prompt_data:
                 request['obj_id'] = prompt_data['obj_id']
-
+        else:
+            raise ValueError(f"不支持的视频提示类型: {prompt_type}")
         response = self.video_predictor.handle_request(request=request)
         return response.get('outputs', {})
 
+    @_serialized_inference
     def propagate_video(self, session_id: str) -> dict:
+        self._require_video_session(session_id)
         self._init_video_model()
         outputs = {}
         for response in self.video_predictor.handle_stream_request(
@@ -618,16 +640,23 @@ class SAM3Service:
             outputs[response["frame_index"]] = response["outputs"]
         return outputs
 
+    @_serialized_inference
     def close_video_session(self, session_id: str):
+        self._require_video_session(session_id)
         if self.video_predictor:
             self.video_predictor.handle_request(
                 request=dict(type="close_session", session_id=session_id)
             )
         self.video_sessions.pop(session_id, None)
 
+    @_serialized_inference
     def shutdown(self):
         if self.video_predictor:
             self.video_predictor.shutdown()
+        self.video_sessions.clear()
         self.video_predictor = None
         self.image_model = None
         self.image_processor = None
+        self.current_image_path = None
+        self.inference_state = None
+        self._image_size = None

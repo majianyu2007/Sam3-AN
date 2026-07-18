@@ -378,6 +378,29 @@ class AnnotationManager:
             self._save_project_annotations(project_id)
             return copy.deepcopy(project)
 
+    @staticmethod
+    def _project_manifest(project: dict) -> dict:
+        """返回不含标注大数组的项目导航清单。"""
+        manifest = {
+            key: value
+            for key, value in project.items()
+            if key != "images"
+        }
+        manifest["images"] = [
+            {
+                key: value
+                for key, value in image.items()
+                if key != "annotations"
+            }
+            for image in project.get("images", [])
+        ]
+        return manifest
+
+    def get_project_manifest(self, project_id: str) -> dict | None:
+        with self._lock:
+            project = self.projects.get(project_id)
+            return copy.deepcopy(self._project_manifest(project)) if project else None
+
     def get_project(self, project_id: str) -> dict | None:
         with self._lock:
             project = self.projects.get(project_id)
